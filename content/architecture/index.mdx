@@ -1,0 +1,51 @@
+---
+title: Overview
+---
+
+# Architecture
+
+This section goes deeper than [Core Concepts](/concepts) into how the three
+implementation layers actually work: the runner that executes a phase graph,
+the trace that records everything durably, and the bay/fleet layer that
+isolates and lands work.
+
+- [The Runner](/architecture/runner) — phase execution, the write-boundary
+  diff, and the budget hard-stop.
+- [Trace &amp; Recovery](/architecture/trace-and-recovery) — the SQLite
+  schema, orphan reconciliation, and exactly what `--resume` does and
+  doesn't re-verify.
+- [Bays, Worktrees &amp; Landing](/architecture/bays-and-landing) —
+  provisioning, autonomy tiers, landing policy, and `shipyard land`.
+
+## Honest limitations
+
+Worth stating here rather than discovering later — from the project's own
+notes, still accurate:
+
+- **The behavior harness is unsolved.** Gates verify structure and claims.
+  They do not verify that the software does the *right* thing.
+- **Gates can pass on bad output.** A gate checks what a predicate can
+  check, not plan quality or code taste. The reviewer phase narrows this;
+  it doesn't close it.
+- **Verification cannot catch what the spec omitted.** The single
+  highest-leverage unsolved problem in this space — a real example from a
+  build against this harness: several acceptance criteria failed not
+  because the code was wrong, but because the spec never said the README
+  had to document required environment variables.
+- **Correlated blind spots.** A builder and a reviewer on similar models can
+  share assumptions. Structural independence (different phases, different
+  boundaries) is not the same thing as formal independence — routing them
+  to different model families closes this partially; see
+  [Model Adapters](/adapters).
+- **Worktree isolation limits collisions, not blast radius.** A bay is a
+  throwaway worktree and the writes gate reverts anything out of bounds —
+  that's not a sandbox. A container boundary is a real next step, not
+  built yet.
+- **Rollback is all-or-nothing.** One out-of-bounds write discards the
+  whole turn's work, including any legitimate parts of it. Partial rollback
+  would require the harness to judge which edits to keep — exactly the
+  judgment it exists to avoid making. The mitigation is smaller phases, not
+  smarter rollback.
+- **Generated acceptance criteria are not trustworthy on their own.** They
+  make "done" machine-checkable and human-reviewable, which is better than
+  nothing and well short of correctness.

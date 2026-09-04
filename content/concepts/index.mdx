@@ -1,0 +1,132 @@
+---
+title: Phases, Envelopes & Gates
+---
+
+# Core concepts
+
+Five ideas compose to make up everything Shipyard does. In dependency order:
+
+## 1. The phase graph
+
+A **workflow** is an ordered list of **phases** (`shipyard/core/runner.py`'s
+`Workflow`/`AgentPhaseSpec`/`EngineerPhaseSpec` types). Each phase has:
+
+- a **name** and **owner** (`planner`, `builder`, `reviewer`, `acceptor`, …
+  — declared per-topology, see [Topologies](/topologies))
+- a **kind** — `agent` (an LLM does the work), `code` (a deterministic
+  function does the work, e.g. running a shell command), or `engineer` (a
+  human decision recorded with no model call at all — used to distinguish
+  *"a person decided this"* from *"a model produced this"* in the trace,
+  which loses exactly the provenance that matters if the two get collapsed)
+- a **prompt** (agent phases) and an **output type** — the Pydantic
+  `Envelope` subclass the phase's result must validate against
+- a **boundary** — which paths this owner may write, enforced by diffing the
+  repo after the phase runs, not by trusting the agent
+
+The runner (`Runner.run()`) walks this list top to bottom, normally. It can
+also **branch backward** — a phase whose `repairs` field names an earlier
+phase sends work back there instead of failing outright. See
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget).
+
+## 2. Envelopes — the only thing that crosses a phase boundary
+
+An agent has exactly two output channels: reference files it writes into the
+bay, and a JSON **envelope** — its final structured response. Context
+transfers phase to phase *in code*, never in conversation; the next phase
+reads a parsed envelope, never a transcript of what the previous agent said.
+
+Every envelope is a Pydantic model, and that's a specific, deliberate choice
+documented in the project's own README:
+
+> `ReviewOutput.model_validate(obj)` either returns a real `ReviewOutput` or
+> raises with the exact field paths that failed, and the required-key list
+> shown to the agent is *derived from the model*, so prompt and enforcement
+> cannot drift.
+
+Every envelope shares a base shape (`status`, `summary`, `artifacts`,
+`notes_for_next_agent`) and each phase kind extends it with what it actually
+needs to report:
+
+```python
+class BuildOutput(Envelope):
+    changed_files: list[str]
+    commit_message: str
+
+class ReviewOutput(Envelope):
+    """Confirmation that what was built is what was asked for — not a test run."""
+    approved: bool
+    findings: list[ReviewFinding]
+    blocking: list[str]        # what must change before approval
+
+class AcceptOutput(Envelope):
+    results: list[CriterionResult]   # one verdict per acceptance criterion, with evidence
+```
+
+`artifacts` is a **claim**, not a fact — a gate (`artifacts_exist`,
+`files_non_empty`) verifies the claimed paths are actually on disk before
+anything downstream trusts them.
+
+## 3. Gates — code checks the agent's output, always
+
+A gate is an async function `(Envelope, BayContext) -> GateReport`. A
+`GateReport` records *every* check it made, passing or failing — deliberately,
+because a gate that returns a bare `True`/`False` can't tell you whether it
+verified three things or zero.
+
+Shipyard ships eight gates (`shipyard/core/gates.py`):
+
+| Gate | Checks |
+|---|---|
+| `artifacts_exist` | every path the agent claimed as an artifact is actually on disk |
+| `files_non_empty` | a claimed artifact that exists but is empty is a claim not honored |
+| `json_parses` | any declared `.json` artifact actually parses |
+| `diff_matches_claims` | every file the agent claimed it changed actually exists |
+| `verdict_consistent` | a review's verdict agrees with the findings it just wrote |
+| `writes_within_boundary` | the boundary described below |
+| `command_succeeds` | a named shell command exits `0` (topology-declared sensors use this) |
+| `budget_not_exceeded` | cumulative run spend hasn't crossed the task's ceiling |
+
+Two of these run on **every agent phase, unconditionally**, regardless of
+what the topology declares:
+
+- **`writes_within_boundary`** — not optional, not topology-configurable.
+  `tools` (what an agent may *attempt*, enforced before the fact by the
+  runtime) and `writes` (what may *survive*, enforced after the fact by
+  diffing the repo) are deliberately two different mechanisms. Withholding a
+  tool can't stop an agent from writing outside its lane — bash can run `git
+  checkout` regardless — so the write boundary is what actually holds, and
+  it's checked by literally diffing the filesystem, never by asking. A
+  violation isn't just reported: **the change is rolled back**, so no later
+  gate is ever measuring work the agent wasn't allowed to do.
+- **`budget_not_exceeded`** — see
+  [Retries, Repair &amp; Budget](/concepts/retries-and-budget) for exactly
+  how this one behaves differently from the rest.
+
+A topology's own `sensors` add more gates on top — code sensors
+(`command_succeeds`, e.g. running the real test suite) and inferential
+sensors (a reviewing skill's judgment call).
+
+## 4. Bays — one isolated worktree per run
+
+Every run gets its own **bay**: a real `git worktree`, not a shared
+checkout. A misbehaving agent's changes are physically isolated to a
+throwaway directory under the system temp dir; nothing it does can touch
+your actual working tree. See
+[Bays, Worktrees &amp; Landing](/architecture/bays-and-landing) for
+provisioning, landing policy, and how a held bay gets merged later.
+
+## 5. The trace — one durable, queryable record
+
+Every phase start/end, every gate check (with a typed `kind`, not just
+prose — a gate failure can be dispatched on *what kind* of thing went wrong
+without string-matching), every correction, every dollar spent, is written
+to SQLite as it happens. The dashboard, `shipyard runs`, and a resumed build
+all read the same tables — there's no separate ingest path, and no
+"generated status claim" standing in for what the trace actually recorded.
+See [Trace &amp; Recovery](/architecture/trace-and-recovery).
+
+---
+
+Next: how a gate failure actually gets corrected instead of restarted, and
+why budget is the one gate that explicitly refuses to play that game — see
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget).

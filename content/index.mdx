@@ -1,0 +1,93 @@
+---
+title: Introduction
+---
+
+# Shipyard
+
+Shipyard is a **deterministic-harness software factory**. It takes a bounded
+software request, turns it into an explicit phase graph, and runs that graph
+through code-owned sequencing, gates, and acceptance checks — with an LLM
+agent doing the work *inside* each phase, never deciding what happens
+*between* phases.
+
+<Callout type="info">
+  This is a living document. It is updated as Shipyard changes — treat any
+  page here as accurate as of its last edit, not as a permanent spec.
+</Callout>
+
+## The one rule everything else falls out of
+
+Shipyard's `runner.py` states its own design principle better than a
+paraphrase would:
+
+> **Code owns sequencing, retries, and acceptance; the agent owns only the
+> work inside one bounded phase.**
+
+Every other design decision in the codebase is a consequence of that one
+line:
+
+- **Success must be earned.** Every phase starts `failed` and only a clean
+  exit, a validated envelope, and green gates flip it to `success`. Nothing
+  defaults to passing.
+- **A gate failure is a correction into the same live session, never a
+  restart.** The agent keeps its context and is told exactly what was wrong.
+- **The `writes` boundary is enforced by diffing the repository**, not by
+  asking nicely. A reviewer that is never handed `Write` still can't be
+  trusted not to try — so the harness diffs the actual filesystem after every
+  phase and rolls back anything outside the declared boundary.
+- **A code phase reports through the same envelope shape as an agent
+  phase**, so the repair loop is identical either way — the runner doesn't
+  need two versions of its own retry logic.
+
+## Why a deterministic harness, and not a more flexible one
+
+An LLM can, in principle, produce almost anything — which makes "a harness
+for any software" an ill-posed problem, not a hard one. Shipyard's own
+`topology.py` module docstring puts this in terms of Ashby's Law:
+
+> A regulator must have at least as much variety as the system it governs.
+> [...] Committing to a topology is the variety-reduction move that makes a
+> complete harness achievable.
+
+Concretely: Shipyard does not attempt to build "any software." It commits to
+a small, closed set of **topologies** — declared shapes of stack, boundaries,
+and gates (see [Topologies](/topologies)) — and only builds things that fit
+one. That's a deliberate trade: less flexibility, in exchange for a harness
+whose guarantees (boundaries enforced, gates real, acceptance evidence-backed)
+actually hold, instead of being aspirational.
+
+## The five things a run always has
+
+Whatever topology is in play, every Shipyard run produces the same five
+things, because they come from the runner and the trace, not from the
+topology or the agent:
+
+1. **A phase graph** — an explicit sequence of typed phases (`plan`,
+   `bootstrap`, `build`, `verify`, `review`, `accept`, and so on), each with a
+   declared owner, boundary, and gates. See [Core Concepts](/concepts).
+2. **Deterministic gates** — boundary checks, budget checks, and
+   topology-declared sensors, all evaluated by code against the agent's
+   output, never taken on the agent's word. See
+   [Runner &amp; Gates](/architecture/runner).
+3. **Bounded retries** — a correctable violation goes back into the same
+   session with what was wrong; a repeated identical failure or an
+   over-budget run stops instead of looping. See
+   [Retries &amp; the Repair Loop](/architecture/runner#the-repair-loop).
+4. **An isolated workspace** — every run gets its own git worktree (a
+   *bay*), so in-progress work never touches a shared checkout. See
+   [Bays, Worktrees &amp; Landing](/architecture/bays-and-landing).
+5. **A durable trace** — every phase, gate result, correction, and dollar
+   spent is written to SQLite as it happens, queryable live or after the
+   fact. See [Trace &amp; Recovery](/architecture/trace-and-recovery).
+
+## Where to go next
+
+- New to the codebase? Start with [Getting Started](/getting-started) to get
+  a clean environment running and `shipyard demo` producing scripted bays
+  with no API key and no cost.
+- Want the mental model before touching code? Read
+  [Core Concepts](/concepts) — phases, envelopes, gates, budget, and bays,
+  the five ideas everything else composes from.
+- Curious what's actually been decided, fixed, and found while building this
+  — including real bugs caught in production use — see
+  [Architecture](/architecture) and [Testing Philosophy](/testing).

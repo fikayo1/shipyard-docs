@@ -1,0 +1,96 @@
+---
+title: Does Every Product Need One?
+---
+
+# Does every new product need a new topology?
+
+Release Manager needed a new topology (`release-manager`, on top of
+`api-service` and `python-api`). Does that mean every new product Shipyard
+builds needs its own topology file? If so — does that scale?
+
+## Short answer
+
+No. A new topology is earned by a new **stack** or a new **operational
+shape**, not by a new **product**. Release Manager needed one because it's
+genuinely different on both counts, not because it's a different product
+from whatever came before it. Most future products will fit an existing
+topology as-is. The count of topologies should grow much slower than the
+count of products — the same way the number of frameworks on a company's
+tech radar grows slower than its number of internal tools.
+
+## What actually varies between the three topologies today
+
+Diffing `api-service` and `python-api` directly:
+
+- **Stack is 100% different.** TypeScript/Fastify/Prisma/Postgres/vitest vs.
+  Python/FastAPI/SQLite/pytest/uvicorn — different language, framework,
+  data layer, test runner, gate commands.
+- **Shape is nearly identical.** Same boundary roles (planner, bootstrap,
+  builder, reviewer, acceptor), same two-tier gate structure, same
+  "protected paths a builder can never touch" concept, same autonomy-tier
+  machinery.
+
+So the two existing topologies are roughly 90% "the same shape wearing
+different stack clothes," and 10% real shape difference — and even that
+10% (scaffold, model routing) is additive, not a fork.
+
+`release-manager` is the actual outlier: it adds two boundary roles neither
+other topology has (`scanner`, read-only against a GitHub repo; `drafter`,
+writes only `release/`), and a `publish`/`rollback` pairing that's
+deliberately **not** agent-owned — code phases, not model judgment calls,
+because the builder is writing code that will hold a live credential.
+That's a new *operational shape*, not just a new stack — which is exactly
+the bar for "this earns a new topology."
+
+## The rule, precisely
+
+A new topology is warranted when a product needs either:
+
+1. **A stack no existing topology declares** — different language,
+   framework, data layer, or test runner, such that the existing gate
+   commands literally cannot run against it. Common, and cheap: mostly a
+   new `stack:` block and new sensor commands, copy-pasted shape.
+2. **A different set of boundary roles or a different autonomy shape** — a
+   role the existing topologies don't have, or a phase that must *not* be
+   agent-owned when it normally is. Rarer, and more consequential — a real
+   architectural decision, not a config edit.
+
+Neither of these tracks "is this a new product." A fourth CRUD API in
+Python against FastAPI/SQLite needs **zero** new topologies — it's
+`python-api`, unmodified.
+
+## Does this scale?
+
+Yes — the topology count is bounded by how many genuinely different
+*stacks and operational shapes* the business chooses to build in, not by
+how many products it builds. A company that standardizes on 3–4 stacks
+(which most do, deliberately — for the same reason topologies favor
+"boring and API-stable" dependencies) plateaus at something like 5–8
+topologies indefinitely, most products landing on an existing one.
+
+## Where duplication starts costing something
+
+`api-service` and `python-api` already duplicate the full
+boundary/gate/autonomy scaffolding structure. At two files this costs
+nothing — reading either one top to bottom is still the fastest way to
+understand it, and the loader's own design philosophy (fail loudly, no
+defaults, single source of truth per topology) is worth more than the DRY
+savings of a shared base at this scale.
+
+That calculus changes if the count reaches, say, 6–8 topologies and every
+new one is still hand-copying the same block. At that point a
+`topology.base.yaml` (shape only — boundary role names, gate structure,
+autonomy defaults) with per-topology overrides for `stack:`, sensor
+commands, and `scaffold:` would remove real duplication — **as long as the
+override mechanism keeps the same three fail-loud rules the loader already
+enforces**: unknown topology is an error, an owner with no boundary is an
+error, an empty `protected` list is an error. Any inheritance layer has to
+fail loud at the *merged* result, not just at each layer independently, or
+it quietly reopens exactly the hole those three rules exist to close.
+
+<Callout type="info">
+  This is future work, not current work. Three topologies with meaningful
+  shape differences between them doesn't justify inheritance machinery yet.
+  Worth reopening once a 4th or 5th topology turns out to be another
+  90%-copy-paste of `python-api`.
+</Callout>

@@ -1,0 +1,231 @@
+---
+title: Command Reference
+---
+
+# CLI reference
+
+One dispatcher, `shipyard`, with one subcommand per verb
+(`shipyard/cli/__main__.py`). Every subcommand's real logic lives in its own
+module and can be run directly too (`python -m shipyard.cli.build`), which is
+what the tests do. Most of what's below is also reachable over HTTP without
+a terminal at all — see [HTTP API Reference](/api) for the endpoint that
+fronts each verb.
+
+```
+shipyard — a fleet-aware software factory
+
+  THE JOURNEY
+    1  shipyard new "<what you want>"     interview you, write spec.md + criteria.json
+    2  shipyard build --spec spec.md      scaffold, plan, build, verify, review, land
+    3  shipyard yard                      watch it, drill into any phase
+
+  ALSO
+    shipyard runs                         recent runs, with their ids
+    shipyard rerun <id>                   run one again with the same inputs
+    shipyard land <id>                    merge a held --repo run's branch now
+    shipyard demo                         four scripted bays. No API key, no cost.
+    shipyard setup --browser-tests        provision shared Playwright + Chromium once
+    shipyard topologies                   the service shapes this factory can build
+    shipyard extensions review <dir>      inspect a generated extension proposal
+    shipyard extensions approve <dir> --approver <name>
+                                          install an approved proposal
+    shipyard extensions propose "<request>"  generate a quarantined proposal
+```
+
+Add `--help` to any of these for its own options. `new` and `build` need
+Claude Code on `PATH` and authenticated; `demo` and `yard` need nothing.
+
+Run `shipyard --help` (or with no arguments) any time — it's the single
+source of truth for the current flag set, kept current by the CLI itself.
+
+## `shipyard new`
+
+Interviews you and writes `spec.md` + `criteria.json`. Needs Claude Code on
+`PATH`, authenticated. This is intake — see
+[Core Concepts](/concepts) for what the two output files actually are.
+
+## `shipyard iterate <repo> "<intent>"`
+
+An alternative starting point to `shipyard new`, for extending an
+**existing** repo instead of starting from a blank spec:
+
+```bash
+shipyard iterate /path/to/existing-repo "add rate limiting to the public API"
+```
+
+Before running the same intake flow `new` uses, it builds a bounded
+"product context" dossier from the target repo: landmark files (README,
+`package.json`, `pyproject.toml`, and similar), each sha256'd and truncated
+to 12KB, a top-level file inventory, the current git HEAD, and whether the
+working tree is dirty. That context is folded into the generated
+`spec.md`'s own "Context" section, so the interview and the resulting
+criteria are grounded in what's actually there instead of assuming a blank
+slate.
+
+<Callout type="warning">
+  `iterate` builds the dossier and writes `spec.md` + `criteria.json` — it
+  does **not** call `build` for you, and it does not inject `--repo` into
+  its own printed "Then: shipyard build ..." suggestion. Passing `--repo
+  /path/to/existing-repo` on the follow-up `build` call is still on you.
+  Forgetting it is exactly what turns an intended extension into a fresh,
+  unrelated greenfield project instead — `build` treats a missing `--repo`
+  as a deliberate signal to scaffold something new, not as an error, so it
+  won't warn you either.
+</Callout>
+
+## `shipyard build`
+
+The main event — scaffold (if greenfield), plan, build, verify, review,
+accept, land. See [Quickstart](/getting-started/quickstart) for a worked
+example and the flags that matter most (`--verify`, `--repo`, `--budget`,
+`--tier`).
+
+### `--resume <run-id>`
+
+Re-enters an **interrupted** run's phase graph instead of restarting from
+scratch. Determines what to skip by checking which phases already have
+`status == 'success'` in the trace — with one deliberate, load-bearing
+exception:
+
+<Callout type="info">
+  **`accept` is never skipped, even if it already succeeded as a phase.** A
+  phase succeeding and its *verdict* being positive are different claims —
+  the acceptor can complete cleanly (produce a well-formed ruling) while that
+  ruling says criteria are failing. A resume that skipped a
+  already-"successful" `accept` phase would report the run as passed without
+  the acceptor ever re-ruling against whatever changed since — which, for a
+  resume, is usually *exactly the thing that changed* (credentials that
+  weren't available before). This was a real bug, caught before it shipped:
+  reverting the one-line exclusion made two regression tests fail
+  immediately.
+</Callout>
+
+Resume can only **re-verify**, never re-*fix* code — if nothing in the bay
+changed since the interrupted run, a resume's fresh acceptance ruling will
+come back identical to the stale one, correctly. Resume is the right tool
+for "it got interrupted, try again" (a network glitch, a missing credential
+that's now available); it is not the right tool for "the software doesn't
+do what was asked yet" — that needs a phase that can actually write code,
+which only `rerun` or a fresh `build` provide.
+
+### `--claude-timeout <seconds>`
+
+A second, separate timeout from `--timeout`, scoped specifically to calls
+made through the Claude Code adapter. Recorded per run in the trace and
+automatically carried forward by `shipyard rerun`, the same way every other
+recorded build flag is.
+
+## `shipyard runs`
+
+Recent runs with their ids, status, topology, and cost — the thing that
+makes a run id something you can look up rather than recall. Reconciles
+orphaned `running` rows unconditionally first (safe here specifically
+because this is a one-shot CLI invocation, called before this process has
+any run of its own to be mistaken for someone else's — see
+[Trace &amp; Recovery](/architecture/trace-and-recovery) for the dashboard's
+different, staleness-aware version of the same reconciliation).
+
+## `shipyard rerun <run-id>`
+
+A **replay, not a resume.** Rebuilds the original `shipyard build` command
+line from what was recorded for that run id, and starts completely fresh —
+new bay, same spec, same criteria, same topology, same tier. The partial
+work in the old bay is not reused, because deciding which half of a failed
+run to keep is exactly the judgment call this harness exists to avoid
+making on your behalf, and a failed build's leftovers are the least
+trustworthy input available.
+
+Any flags you pass override the recorded ones — so a rerun can raise a
+budget:
+
+```bash
+shipyard rerun 919566e3 --budget 15
+```
+
+## `shipyard land <run-id>`
+
+Merges a **held** `--repo` run's branch into its target repo, on your
+explicit say-so, right now. Only meaningful for `--repo` builds — a
+greenfield run has no upstream to merge into; its bay *is* the deliverable,
+already copied out at the end of the build.
+
+```
+usage: shipyard land <run-id>
+```
+
+Refuses, with a clear reason and without touching git, when:
+
+- the run wasn't built with `--repo` (nothing to land — "a greenfield run is
+  delivered to its own project directory instead")
+- the run's own status isn't `done` (still running or crashed — unvetted)
+- the bay's status isn't `held` (nothing here is actually waiting on this
+  decision)
+
+On success, it fast-forward-merges the branch and **flips the bay's status
+to `done`** — without this, a landed bay stays marked "held" forever and the
+yard view keeps offering to land something already landed (a real gap found
+and fixed while building this feature).
+
+The guard logic here is deliberately this command's job, not the underlying
+`BayManager.land_now()`'s — `land_now` does the merge and nothing else, no
+autonomy check, no status check, because by the time a human runs this
+command, the human's judgment already *is* the check. The exact same
+function backs the dashboard's Land button (`POST /api/run/<id>/land`) —
+see [Dashboard](/dashboard).
+
+## `shipyard demo`
+
+Four scripted bays, running in parallel. No API key, no cost. See
+[Quickstart](/getting-started/quickstart) for what it demonstrates.
+
+## `shipyard topologies`
+
+Lists the service shapes this factory can build — name, description, stack,
+verify command, whether it can scaffold from nothing, and its declared
+boundary roles. See [Topologies](/topologies).
+
+## `shipyard setup --browser-tests`
+
+```bash
+shipyard setup --browser-tests
+```
+
+Provisions a shared Playwright installation plus its Chromium binary once,
+ahead of any build. Exists specifically so the acceptor phase never has to
+install Playwright and download a browser binary for the first time under
+its own per-request timeout — installing the package and fetching Chromium
+from scratch can alone take longer than a single correction cycle's budget,
+which previously showed up as `agent timed out after 300s` failures on
+builds whose acceptance criteria required actually driving a UI. Run this
+once per machine (or once per environment) before building anything whose
+topology expects real browser-driven acceptance.
+
+## `shipyard extensions` — governed extension learning
+
+Three subcommands for handling a stack or capability Shipyard doesn't
+already know how to verify, without letting the harness silently invent its
+own rules for it:
+
+- **`shipyard extensions propose "<request>"`** — spawns an agent to
+  research the request and produce a quarantined proposal (an
+  `extension.yaml` plus supporting files) written to its own output
+  directory. Nothing here is installed or trusted yet.
+- **`shipyard extensions review <dir>`** — prints a generated proposal's
+  `extension.yaml` and files, so a human can actually read it before any
+  decision is made.
+- **`shipyard extensions approve <dir> --approver <name>`** — the only way
+  a proposal becomes real: installs it as a hash-pinned, versioned
+  policy/capability Shipyard can reuse on future builds, with `<name>`
+  recorded as who approved it.
+
+The propose → review → approve split exists so a model can suggest how to
+verify something new, but never quietly grant itself the ability to build
+against it — a human has to read the proposal and explicitly approve it
+first.
+
+## `shipyard yard`
+
+Starts the dashboard (the yard view) on `http://localhost:4800` by default
+(`PORT` env var to change it). See [Dashboard](/dashboard) for what it shows
+and what it can now *do* — resume, restart, and land a run from the browser,
+not just watch it.

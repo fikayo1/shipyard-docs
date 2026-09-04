@@ -1,0 +1,12 @@
+:root {
+  --sy-accent: #2f6feb;
+}
+
+.nextra-nav-container .nx-font-bold,
+nav[class*='navbar'] span {
+  letter-spacing: -0.01em;
+}
+
+code {
+  font-variant-ligatures: none;
+}

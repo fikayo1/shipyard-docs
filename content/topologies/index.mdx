@@ -1,0 +1,93 @@
+---
+title: What a Topology Is
+---
+
+# Topologies
+
+A topology (`topologies/<name>/topology.yaml`) is the single source of
+truth for one service shape: its stack, its boundary roles, its protected
+paths, and its sensors. The runner has **no other way** to obtain any of
+these — there are no boundary literals anywhere else in the codebase, so
+the file and the enforcement can never quietly drift apart.
+
+`shipyard/core/topology.py`'s own module docstring frames why this matters
+more than it might look:
+
+> An LLM can produce almost anything, so a harness for "any software" is not
+> a hard problem — it is an ill-posed one. Committing to a topology is the
+> variety-reduction move that makes a complete harness achievable.
+
+## Fields on a `Topology`
+
+```python
+@dataclass(frozen=True, slots=True)
+class Topology:
+    name: str
+    description: str
+    stack: dict[str, str]                 # language, framework, data layer, test runner, ...
+    layers: list[str]                     # the architectural layers a builder should respect
+    boundaries: dict[str, Boundary]       # owner -> {writes, tools}
+    protected: list[str]                  # paths no agent may ever touch
+    sensors_in_loop: list[Sensor]         # pre-land checks (usually code: run the real tests)
+    sensors_post_integration: list[Sensor]  # post-merge checks (often inferential: a review skill)
+    safe_change_classes: list[str]        # change classes eligible for auto-land at LAND_SAFE
+    models: dict[str, str]                # optional per-owner model routing
+    operator_secrets: list[OperatorSecret]  # env vars the DELIVERED PRODUCT needs (not the build)
+    scaffold: Path | None                 # stamped-by-code starter files for a greenfield build
+```
+
+## Fail loudly, never default
+
+Three rules, stated in the loader's own docstring, each existing because the
+quiet alternative is a security hole:
+
+- **An unknown topology name is an error**, never a silent fallback to a
+  default shape.
+- **An owner with no declared boundary is an error.** Defaulting to `[]`
+  would silently make that owner read-only and every phase using it would
+  fail for a reason nobody could see; defaulting to `["**"]` would silently
+  grant write access to everything. There is no safe guess, so there's no
+  guess.
+- **An empty `protected` list is an error.** That list is what stops an
+  agent editing the machinery that grades it — an absent-mindedly empty one
+  looks exactly like a deliberate one, so it isn't allowed to happen
+  quietly.
+
+## `writes` vs. `tools` — two different mechanisms, on purpose
+
+```python
+@dataclass(frozen=True, slots=True)
+class Boundary:
+    writes: list[str]
+    tools: list[str] | None = None
+```
+
+`writes` is enforced **after the fact**, by diffing the repository — it's
+what may *survive*. `tools` is enforced **before the fact**, by the
+runtime — it's what may be *attempted*. Neither substitutes for the other:
+withholding a tool can't stop an agent changing files (bash can run `git
+checkout` regardless of what tools were offered), which is why `writes`
+exists at all. But a boundary alone would let a read-only reviewer spend a
+turn writing code that then gets reverted — learning nothing, and billing
+you for the attempt — so a reviewer role should never be handed `Write` in
+the first place.
+
+## The three topologies today
+
+| | `api-service` | `python-api` | `release-manager` |
+|---|---|---|---|
+| Stack | TypeScript, Fastify, Prisma, Postgres, vitest | Python, FastAPI, SQLite, pytest, uvicorn | Python, FastAPI, SQLite, pytest, uvicorn |
+| Scaffold | — | `./scaffold` | `./scaffold` |
+| Boundary roles | planner, bootstrap, builder, reviewer, acceptor | same | same, **plus** `scanner` (read-only) and `drafter` (writes only `release/`) |
+| Notable difference | — | — | `publish`/`rollback` are deliberately **code phases**, not agent-owned — a model never makes the actual publish decision |
+
+`api-service` and `python-api` are close to a pure stack swap — same
+boundary roles, same two-tier gate structure (pre-land code checks,
+post-integration inferential review), same autonomy machinery, entirely
+different stack. `release-manager` is the outlier: it adds boundary roles
+neither other topology has, and a phase pairing that's deliberately *not*
+agent-owned when it normally would be, because the builder is writing code
+that will hold a live GitHub credential. See
+[Does Every Product Need One?](/topologies/scaling) for when a new product
+actually earns a new topology, versus when it should just use `python-api`
+unmodified.

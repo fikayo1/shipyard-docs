@@ -1,0 +1,111 @@
+---
+title: 'Bays, Worktrees & Landing'
+---
+
+# Bays, worktrees & landing
+
+`shipyard/fleet/bay.py` — provisioning, and the policy decision that
+determines what happens to a run's work once it's done.
+
+## Two provisioning paths
+
+```python
+async def provision(self, task: Task, run_id: str) -> Bay:
+```
+
+- **Greenfield** — no `repo` on the task. There's nothing to branch from, so
+  the bay starts as an empty git repo with one root commit; the bootstrap
+  phase stamps the topology's scaffold into it.
+- **Existing repo** (`--repo <path>`) — a real `git worktree` off that repo,
+  on its own branch. The agent's changes are physically isolated to a
+  throwaway directory under the system temp dir (`bays_root`, defaulting to
+  `<tempdir>/shipyard-bays`); nothing it does can touch your actual working
+  tree until landing decides otherwise.
+
+## Landing is a policy decision, never the agent's
+
+```python
+async def land(self, bay, task, policy, had_gate_failure) -> dict[str, str | None]:
+```
+
+The agent proposes a commit message on its envelope; **code** decides
+whether to use it, whether to merge, whether to open a PR, or whether to
+hold. The function's own docstring states the one thing that makes this
+correct rather than just tidy:
+
+> **The order of these checks is the policy.** The circuit breaker is
+> tested first, ahead of every other reason to hold, and that is not
+> stylistic.
+
+This was a real bug once, fixed, and worth understanding because the same
+shape of mistake is easy to reintroduce. When the checks ran in a different
+order, a greenfield run that had failed a gate reported *"greenfield run —
+the bay is the artifact"* as its landing reason: true, and a complete
+concealment of the fact that a boundary was violated. The behavior was
+right (it held either way) — the **record** was wrong, which is the harder
+bug to find, because nothing looks broken from the outside. Each branch
+below returns the reason recorded in the trace, so whichever check fires
+first doesn't just win, it becomes the explanation a human reads six weeks
+later:
+
+```python
+if had_gate_failure and policy.demote_on_gate_failure:
+    return {"mode": "hold", ..., "reason": "a gate failed in this run — landing demoted to hold"}
+if task.autonomy <= AutonomyTier.OBSERVE:
+    return {"mode": "hold", ..., "reason": "autonomy tier is observe — read-only run"}
+if not task.repo:
+    return {"mode": "hold", ..., "reason": "greenfield run — the bay is the artifact"}
+if policy.mode == "hold" or task.autonomy == AutonomyTier.PROPOSE:
+    return {"mode": "hold", ..., "reason": "policy holds the branch for human review"}
+if policy.mode == "merge":
+    result = await self.land_now(task.repo, bay.branch)
+    return {"mode": "merge", "ref": result["sha"], "reason": "fast-forwarded into baseRef"}
+# "pr" mode is deliberately not implemented — a stub that silently does
+# nothing is worse than an honest gap.
+return {"mode": "hold", ..., "reason": "pr mode is not implemented in this slice; branch held"}
+```
+
+## Autonomy tiers
+
+```python
+class AutonomyTier(IntEnum):
+    OBSERVE = 0    # read-only; landing always holds
+    PROPOSE = 1    # may write to its own bay branch; a human reviews and merges
+    LAND_SAFE = 2  # may land automatically if safe_change_classes and gates allow it
+```
+
+Note from the `land()` logic above: `PROPOSE` **always** holds, regardless
+of `policy.mode`. This is easy to trip over writing tests against the
+`merge` policy path — a task fixture at `PROPOSE` will hold no matter what
+the landing policy says, because the autonomy check runs first.
+
+## `land_now` — the manual counterpart, with no policy check
+
+```python
+async def land_now(self, repo: str, branch: str) -> dict[str, str]:
+```
+
+This is what both `shipyard land <run-id>` and the dashboard's Land button
+call. Its own docstring is explicit about why it deliberately skips every
+check `land()` runs:
+
+> **No policy check happens here, and that is the point.** `land()`
+> decides *for* an autonomous run whether a change is safe enough to merge
+> with nobody looking. `land_now` is invoked *by* a human who already
+> looked.
+
+The guard rails that make `shipyard land` safe to run (refusing a run
+that's not `done`, refusing a bay that's not `held`, refusing a greenfield
+run) live in the **caller** — `_land()` in the CLI, and the dashboard's
+`_post_land()` — not in `land_now` itself, which does a fast-forward merge
+and nothing else. See [CLI Reference](/cli#shipyard-land) for the exact
+refusal conditions and messages.
+
+## Bays are not a sandbox
+
+Worth restating plainly: worktree isolation limits **collisions**, not
+**blast radius**. The writes gate reverts anything outside a phase's
+declared boundary, but an agent phase with `Bash` in its tool list can still
+run arbitrary commands inside its own worktree — a container boundary, not
+built yet, is the actual next step for containing what an agent can do to
+the machine itself, as opposed to the repository.

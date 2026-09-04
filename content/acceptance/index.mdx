@@ -1,0 +1,110 @@
+---
+title: Criteria & Scorecards
+---
+
+# Acceptance & criteria
+
+`criteria.json` is *the definition of done* — a list of machine-checkable,
+evidence-required criteria, compiled at intake (or hand-written, for a spec
+that needs it), living in every topology's `protected` list so no agent can
+edit or quietly drop one.
+
+## Why the agent doesn't write the file
+
+The acceptor rules on criteria; **code**, not the agent, writes the
+verdicts back into `criteria.json`. `shipyard/core/criteria.py`'s module
+docstring states why plainly:
+
+> An acceptor that could edit `criteria.json` could mark its own work
+> passing, or quietly drop a criterion it couldn't satisfy — which is the
+> same failure as an agent deleting a requirement, arriving one step later
+> in the process.
+
+So the agent returns verdicts in an `AcceptOutput` envelope
+(`results: list[CriterionResult]`), and `apply_results()` — pure code —
+rewrites `criteria.json` from the **original** entries, changing only
+`passes` and `evidence` per criterion:
+
+```python
+def apply_results(bay: Path, results) -> Scorecard:
+    doc = json.loads(path.read_text("utf8"))
+    verdict = {r.id: r for r in results}
+    for c in doc.get("criteria", []):
+        r = verdict.get(c["id"])
+        c["passes"] = bool(r and r.passes)
+        c["evidence"] = r.evidence if r else "not ruled on"
+    ...
+```
+
+Rewriting from the original entries — not from anything the agent sent —
+means a criterion's text can't drift: description, verification steps, and
+priority stay exactly as intake wrote them.
+
+## What makes a verdict trustworthy at all
+
+A `criteria_ruled_on` **gate** — not a post-hoc check — runs against the
+acceptor's own envelope before it's accepted:
+
+- **Every criterion must be ruled on.** Silence isn't a pass, and a
+  criterion that disappears between intake and acceptance is the whole
+  problem this exists to prevent.
+- **No invented ids.** An acceptor grading work nobody asked for is
+  measuring something, but not this.
+- **Evidence is required either way.** *"It passes"* with nothing to show
+  is the exact claim this project exists to refuse — a verdict with fewer
+  than three words of evidence is rejected outright.
+
+A failure here is a **correction into the same live session** (see
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget)) — the acceptor
+keeps everything it just learned from actually running the software, and
+only has to fill the gaps named.
+
+## Evidence gets truncated for display — the real text lives in the file
+
+Worth knowing before assuming a criterion's stated reason is the whole
+story: both the CLI's printed summary and the trace's stored message
+truncate a failing criterion's evidence to **88 characters, no ellipsis**
+(`why[:88]` in `build.py`'s own print). The full, untruncated evidence the
+acceptor actually wrote is only ever in `criteria.json` itself, inside the
+bay:
+
+```python
+scorecard.failing[:6]  # printed to the terminal
+for cid, why in scorecard.failing[:6]:
+    print(f"      ✗ {cid}  {why[:88]}")
+```
+
+If a failing criterion's reason looks cut off mid-sentence in a terminal or
+the trace, it is — read `criteria.json` directly for the real text.
+
+## A real example: a first live scorecard
+
+A live acceptance run against real, credentialed infrastructure — the kind
+a `python-api`- or `release-manager`-shaped topology can require — came
+back 8 of 13 criteria passing. The 5 failures split into two genuinely
+different categories, worth telling apart because they need different
+fixes:
+
+**Operator-credential gaps — not code bugs.** Three criteria (a bad-token
+rejection check, a scan-completeness check, and a real-publish check) all
+had their *negative* paths fully verified (a bad token fails loud, a fake
+external-service seam behaves correctly) but their *positive* path — the
+actual live call — needed a real credential and a real target environment
+the acceptor didn't have yet. No rebuild fixes this; only supplying real,
+working credentials does. The publish criterion's own text said so
+explicitly: *"Requires a real credential and a designated test target —
+this step is exercised by an operator with real credentials, not
+simulated."*
+
+**Real, fixable gaps.** One criterion partly failed because the README
+never documented the required environment variables — pure documentation,
+fixable without any credentials at all. Another failed because the acceptor
+looked for `.shipyard/trace.db` *inside the delivered product's own repo*
+and correctly found nothing — that database is `shipyard-py`'s own, shared
+across every project it's ever built, not something a delivered product
+should own or embed a stale copy of. The fix was a spec change: have the
+README point at where the trace actually lives (path + run id + inspect
+command), not manufacture a copy.
+
+See [Operator Secrets](/getting-started/operator-secrets) for the full
+mechanics of the first category.

@@ -1,0 +1,73 @@
+---
+title: Installation
+---
+
+# Installation
+
+Requires **Python 3.11+**. No database server, no Docker, no external
+services to stand up first — SQLite and `asyncio` are both standard library.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+<Callout type="warning">
+  On some Python builds, an editable install's `.pth` entry is silently
+  skipped by `site.py` — `pip` reports success, but `import shipyard` fails
+  with no explanation. `PYTHONPATH` is read by the interpreter *before*
+  `site.py` runs, so it can't be skipped the same way, and it keeps edits
+  live without reinstalling:
+
+```bash
+echo "export PYTHONPATH=\"$PWD:\$PYTHONPATH\"" >> .venv/bin/activate
+deactivate && source .venv/bin/activate
+```
+</Callout>
+
+## Verify the install
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+This should pass with no network access and no API key required — every test
+either exercises pure logic, spins up a real (throwaway) git repo or HTTP
+server, or drives a **scripted adapter** that replays a fixed script instead
+of calling a model. See [Testing Philosophy](/testing) for why that
+distinction matters.
+
+## What's needed for what
+
+Not every Shipyard command needs the same things:
+
+| Command | Needs |
+|---|---|
+| `shipyard demo` | Nothing — scripted adapter, no API key, no cost |
+| `shipyard yard` | Nothing — reads the local trace database |
+| `shipyard runs` / `rerun` / `land` | Nothing beyond the trace database |
+| `shipyard new` | Claude Code on `PATH`, authenticated |
+| `shipyard build` | Claude Code on `PATH`, authenticated, plus whatever the target topology's operator secrets declare (see [Operator Secrets](/getting-started/operator-secrets)) |
+
+Run `shipyard` with no arguments any time to see the current command list —
+it's the single source of truth for what's available, kept current by the
+CLI itself rather than by hand-copying command names into a doc that drifts.
+
+## Layout
+
+```
+shipyard-py/
+├── shipyard/
+│   ├── core/         # types, contracts, gates, runner, trace, adapter, topology loader
+│   ├── fleet/         # bay (worktree provisioning + landing), yard scheduler
+│   ├── adapters/       # claude_code, openai_compatible, routing
+│   ├── cli/           # the shipyard command dispatcher and its subcommands
+│   └── dashboard/      # the yard view server + page
+├── topologies/          # service shapes — loaded as config, not decorative
+├── specs/               # per-product spec.md + criteria.json (one per product)
+├── tests/                # pytest — see Testing Philosophy
+└── examples/              # demo.py, the scripted no-cost walkthrough
+```
+
+Next: run [the quickstart](/getting-started/quickstart) — demo first (free),
+then a real `new` → `build` run.

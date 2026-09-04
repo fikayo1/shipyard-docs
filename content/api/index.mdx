@@ -1,0 +1,150 @@
+---
+title: HTTP API Reference
+---
+
+# HTTP API reference
+
+Everything `shipyard` can do from a terminal, another agent, another
+service, or the dashboard's own UI can now reach over HTTP —
+`shipyard/dashboard/server.py`, started with `shipyard yard`
+(`http://localhost:4800` by default, `PORT` to change it). This page is the
+complete, current endpoint list. See [Dashboard](/dashboard) for how the
+same file also serves the yard view's UI and the mechanics behind
+resume/rerun/land; this page is the "call it from code" reference.
+
+## The one rule everything here follows
+
+**Every endpoint is a second front door onto a command that already exists
+at a terminal — never a second implementation of it.** A write endpoint
+either spawns the exact CLI subcommand a person would type
+(`python -m shipyard.cli.__main__ <verb> ...`), or calls the exact library
+function that CLI subcommand calls. That means the guards a terminal user
+gets — refusing to land a run that never finished, refusing a second
+resume while one is already running — are the guards a caller over HTTP
+gets too, because it is the literal same code path.
+
+## Two guards, off by default
+
+- **`SHIPYARD_API_KEY`** — unset by default, meaning the server is open to
+  anyone who can reach the port (fine on `localhost`, not fine on the open
+  internet). Set it and every `/api/*` request — reads included, not just
+  writes — must carry `Authorization: Bearer <key>`. Turning this on before
+  the port is reachable from anywhere but your own machine is the
+  operator's job; the server will not guess at it.
+- **`SHIPYARD_MAX_CONCURRENT_JOBS`** (default `3`) — each job-spawning
+  endpoint below launches a real local model-provider process. A caller
+  past the cap gets `429`, not a silently queued or dropped request.
+
+## The typical flow: submit, poll, act
+
+Most of this API follows one shape, whether you're starting brand-new work
+or extending something that exists:
+
+1. **Submit.** `POST` one of the job-spawning endpoints below. Every one of
+   them answers immediately with `202` and a `job_id` (or, once a run
+   exists, a `run_id`) — never blocks waiting for the agent to finish.
+2. **Poll.** `GET /api/job/<job_id>` (or `/api/job/<job_id>/log` for the
+   tail of its output) until a `run_id` shows up in the log, then switch to
+   polling `GET /api/run/<run_id>` the same way the dashboard UI does.
+3. **Act**, once you have a `run_id`: resume an interrupted run, rerun it
+   fresh, stop it, or land it — the same four actions a terminal user has,
+   over HTTP.
+
+```bash
+# 1. submit
+curl -s -X POST localhost:4800/api/intake \
+  -d '{"intent": "a bookmark API where I save URLs with tags"}' | jq
+
+# 2. poll (repeat until the log shows a run_id, or just tail it)
+curl -s localhost:4800/api/job/<job_id>/log | jq -r .log
+
+# 3. once you have a run_id, watch it the same way the dashboard does
+curl -s localhost:4800/api/run/<run_id> | jq '.run.status'
+```
+
+## Starting new work
+
+| Endpoint | Spawns | Notes |
+|---|---|---|
+| `POST /api/intake` | `shipyard new "<intent>"` | Body: `intent` (required), plus optional `topology`, `project_kind`, `provider`, `model`, `out`, `timeout`. `stdin=DEVNULL` — an unanswerable interview question is recorded as an assumption instead of hanging. |
+| `POST /api/iterate` | `shipyard iterate <repo> "<intent>"` | Body: `repo` and `intent` (both required — the existing Git repository to extend, and the next increment), plus optional `out`, `topology`, `provider`, `model`, `timeout`, `refresh_context`. Builds the same bounded product-context dossier the CLI does before handing off to intake. |
+| `POST /api/builds` | `shipyard build` | Body: either `intake` (a `shipyard new`/`iterate` output directory) or `spec` (a `spec.md` path, usually with `criteria`) — one of the two is required. Plus optional `topology`, `repo`, `budget`, `tier`, `provider`, `model`, `verify`, `projects`. |
+
+All three answer `202 {job_id, kind, status: "running", log}` immediately.
+
+<Callout type="warning">
+  `iterate`, unlike `new`, does not know your intent to extend a specific
+  repo unless you pass `--repo` (or its API equivalent) again at build time.
+  Forgetting it is exactly what turns an intended extension into a fresh,
+  unrelated greenfield project — `build` treats a missing `repo` as a
+  deliberate signal to scaffold something new, not as a mistake to flag.
+</Callout>
+
+## Provisioning and governed extensions
+
+| Endpoint | Spawns / calls | Notes |
+|---|---|---|
+| `POST /api/setup/browser-tests` | `shipyard setup --browser-tests` | Provisions a shared Playwright + Chromium install once, ahead of any build whose acceptance drives a real UI. A job like the above — the first run downloads a real browser binary. |
+| `GET /api/topologies` | `load_topology()` for every topology on disk | Synchronous — no agent involved. Returns `{topologies: [{name, description, stack, verify_command, scaffold, roles, runtime_capabilities}, ...]}`. |
+| `POST /api/extensions/propose` | `shipyard extensions propose "<request>"` | Body: `intent` (required — the unsupported stack/capability), plus optional `out`, `provider`, `model`, `timeout`. A job — this is a real agent call, researching and drafting a quarantined proposal. |
+| `GET /api/extensions/review?dir=<path>` | reads `extension.yaml` + files | Synchronous. `404` if `dir` has no `extension.yaml`. Nothing here is installed — inspection only. |
+| `POST /api/extensions/approve` | `install_approved_extension()` | Body: `dir` and `approver` (both required). Synchronous — the only step that makes a proposal real: a hash-pinned, versioned policy/capability Shipyard can reuse. `422` if the proposal is malformed or that exact version is already installed (installed extensions are immutable, not replaceable). |
+
+The propose → review → approve split is deliberate: a model can suggest how
+to verify something new, but never grant itself the ability to build
+against it. Only `approve` — a synchronous, human-invoked call naming a
+real `approver` — makes a proposal load-bearing.
+
+## Watching and acting on a run
+
+| Endpoint | Effect |
+|---|---|
+| `GET /api/yard` | The dashboard's own summary list — every run, most recent first. Reconciles stale `running` rows first. |
+| `GET /api/events?since=<cursor>` | Everything since a cursor — the same query the live view and full history both use, just different polling cadence. |
+| `GET /api/run/<id>` | One run's full detail: phases, gates, corrections, cost. Reconciles stale rows first. |
+| `GET /api/run/<id>/trail` | The bay's live file/commit state — changed files, recent commits, a diff stat. |
+| `GET /api/run/<id>/trail/diff?path=<file>` | The actual unified diff for one changed file. |
+| `POST /api/run/<id>/resume` | Spawns `shipyard build --resume <id>`. `409` if one is already in flight for this run. |
+| `POST /api/run/<id>/rerun` | Spawns `shipyard rerun <id>` — a fresh bay, not a resume. |
+| `POST /api/run/<id>/stop` | Sends `SIGTERM` (then `SIGKILL` if needed) to whichever process owns this run, dashboard-spawned or terminal-spawned. |
+| `POST /api/run/<id>/land` | Calls `BayManager.land_now()` directly — the exact function `shipyard land` calls. `400`/`409` for the same reasons the CLI refuses: not a `--repo` build, run not `done`, bay not `held`. |
+| `GET /api/run/<id>/log` | Tails a dashboard-spawned resume/rerun's stdout+stderr. |
+
+See [Dashboard](/dashboard) for the reconciliation staleness window, the
+`env=os.environ.copy()` gotcha behind a resume that silently never starts,
+and why `runs.status` and `bays.status` have to be tracked independently.
+
+## Per-run support chat and deployment approval
+
+Two newer, run-scoped capabilities, both gated behind an explicit human
+approval before anything with a side effect happens:
+
+- **`GET /api/run/<id>/support`** — the chat history and any pending
+  support actions for this run.
+- **`POST /api/run/<id>/support`** — body `{"message": "..."}`. One
+  tool-free LLM turn answering a question about this run, grounded only in
+  its own compact, redacted trace evidence (recent events, phase status,
+  cost) — never given tools, never allowed to resume/rerun/spend/deploy on
+  its own.
+- **`POST /api/run/<id>/support/actions/<action_id>/approve`** — approves a
+  previously-proposed support action. For a `deploy_vercel` action, this is
+  the one call that actually runs `vercel --prod --yes` — gated further by
+  `SHIPYARD_ENABLE_VERCEL_DEPLOY=1` and a check that the repo's `HEAD`
+  still matches what was planned.
+- **`POST /api/run/<id>/deployment/plan`** — body `{"project": "...",
+  "root": "."}`. Proposes (never executes) a Vercel deployment plan for a
+  completed, clean `--repo` run — the plan an operator then approves via
+  the endpoint above.
+
+## Job polling
+
+| Endpoint | Answers |
+|---|---|
+| `GET /api/job/<job_id>` | `{job_id, kind, running, exit_code, log}` — status only. |
+| `GET /api/job/<job_id>/log` | The same, plus the log tail (last 20,000 characters). |
+
+`job_id` and `run_id` are deliberately different things: a `job_id` exists
+the instant `/api/intake`/`/api/builds`/`/api/iterate`/etc. return, before
+the spawned process has necessarily gotten far enough to create a `run_id`
+at all. Watch the job's log for the run id once one appears, then switch to
+polling `/api/run/<run_id>` for everything after that.

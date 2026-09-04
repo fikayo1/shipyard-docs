@@ -1,0 +1,121 @@
+---
+title: Writing a New Topology
+---
+
+# Writing a new topology
+
+Before writing one, read
+[Does Every Product Need One?](/topologies/scaling) — most new products
+don't need a new topology at all, they need `python-api` (or whichever
+existing topology matches their stack) unmodified. Write a new one only when
+a product needs a stack no existing topology declares, or genuinely
+different boundary roles / autonomy shape.
+
+## A complete, annotated example
+
+This is `topologies/python-api/topology.yaml` in full — every topology
+follows this same shape:
+
+```yaml
+name: python-api
+description: >
+  HTTP service in Python with a typed request layer and a SQLite store.
+
+stack:
+  language: python3.11
+  framework: fastapi
+  data: sqlite
+  test: pytest
+  server: uvicorn
+
+layers: [models, store, service, routes]
+dependency_direction: downward_only
+
+boundaries:
+  planner:   { writes: ["specs/"], tools: [Read, Glob, Grep, Write] }
+  bootstrap: { writes: ["**"], tools: [Read, Glob, Grep, Write, Edit, Bash] }
+  builder:   { writes: ["src/", "tests/"], tools: [Read, Glob, Grep, Write, Edit, Bash] }
+  reviewer:  { writes: [], tools: [Read, Glob, Grep, Bash] }
+  acceptor:  { writes: [], tools: [Read, Glob, Grep, Bash] }
+
+protected:
+  - .shipyard/
+  - topologies/
+  - criteria.json
+  - init.sh
+  - shipyard.config.yaml
+
+sensors:
+  in_loop:
+    - { kind: code, cmd: ".venv/bin/python -m pytest -q" }
+  post_integration:
+    - { kind: code,        cmd: ".venv/bin/python -m pytest -q" }
+    - { kind: inferential, skill: "architecture-review" }
+    - { kind: inferential, skill: "security-review" }
+
+safe_change_classes:
+  - docs
+  - tests
+  - route_handler_within_existing_module
+  - log_statement
+
+scaffold: ./scaffold
+```
+
+## Field-by-field guidance
+
+**`stack`** — every entry should earn its place by the *sensor* it hands
+you for free, not by fashion. `python3.11`/`pytest` isn't chosen because
+Python is popular; it's chosen because "the sensor an agent can run itself,
+in under a second" is a real property that shapes everything downstream.
+Keep the dependency surface small and API-stable — an agent needs to be
+able to hold the whole thing in context, and a large or fast-moving library
+defeats that.
+
+**`boundaries`** — give the reviewer and acceptor `Bash` deliberately, even
+though they're read-only w.r.t. `writes`. A reviewer that can only *read*
+the diff ends up trusting the builder's claims wholesale, which is exactly
+the independence the review phase exists to provide. It needs to be able to
+**run** the test suite to form its own opinion.
+
+**`protected`** — never leave this empty. It's the list stopping an agent
+from editing the machinery that grades its own work. `criteria.json`
+belongs here even though an agent needs to interact with it — see
+[Acceptance &amp; Criteria](/acceptance) for how `passes` gets flipped by
+code, never by the agent directly.
+
+**`sensors`** — split by cost, not by category. `in_loop` sensors run
+inside the agent's own loop on every change (cheap, usually the real test
+suite). `post_integration` sensors run once after integration (can afford
+to be expensive — an inferential review skill's judgment call).
+
+**`safe_change_classes`** — anything *not* listed here is held for a human
+at `AutonomyTier.LAND_SAFE`, deliberately including new dependencies and
+schema migrations. This list should stay conservative; it's the one place a
+topology decides what can land unattended.
+
+**`scaffold`** — a relative path to files stamped **by code**, not written
+by an agent. Scaffolding from a template isn't a judgment call, and having
+an agent do it burns a context window retyping a file that never changes.
+Point this at an actual directory or omit the key — a config key pointing
+at a file that doesn't exist is worse than an honest gap, so the loader
+doesn't accept a dangling reference.
+
+**`models`** (optional) — per-owner model routing, `"claude:<model>"` or
+`"openai:<model>"`. Absent by default so existing verified runs keep
+behaving exactly as they did before the key existed. See
+[Model Adapters](/adapters) for the routing mechanics and why putting the
+builder and reviewer on different model families is worth doing (a
+correlated blind spot otherwise — see the project's own "Honest
+limitations" notes).
+
+## Verify it loads
+
+```bash
+shipyard topologies
+```
+
+Lists every topology the loader can find, its stack, its verify command,
+whether it can scaffold, and its boundary roles — this is the fastest way
+to confirm a new `topology.yaml` parses and looks the way you intended
+before ever pointing a real `shipyard build` at it.

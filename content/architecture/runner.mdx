@@ -1,0 +1,97 @@
+---
+title: The Runner
+---
+
+# The runner
+
+`shipyard/core/runner.py` — the machine that turns a `Workflow` (an ordered
+list of phase specs) into a `RunResult`, one phase at a time.
+
+## Three phase kinds, one repair loop
+
+```python
+if spec.kind == "engineer":
+    outcome = self._run_engineer_phase(phase, spec)
+elif spec.kind == "agent":
+    outcome = await self._run_agent_phase(task, bay, phase, spec, previous, usd)
+else:  # "code"
+    outcome = await self._run_code_phase(bay, phase, spec)
+```
+
+A **code phase** reports through the exact same envelope shape as an agent
+phase, deliberately — so the repair loop (send the failure back to an
+earlier phase, bounded, stop on an identical repeated failure) is identical
+regardless of which kind failed. See
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget) for the shared
+mechanics.
+
+## Inside `_run_agent_phase`
+
+Per attempt (bounded by `retries`, default 2 → up to 3 attempts):
+
+1. **Parse the envelope against its contract.** A parse failure or a missing
+   required field is a *correctable* violation — the agent is told exactly
+   what's wrong and keeps its live session. This is validated in the
+   runner, not the adapter, deliberately: an adapter's job is getting bytes
+   back from a model; acceptance is the runner's job, like every other gate.
+2. **Run the boundary gate and the budget gate — unconditionally, on every
+   agent phase, not something a topology can opt out of** — then the
+   topology's own `spec.gates`.
+3. **Dispatch on violation *kind*, never on the wording of the note.** A
+   `boundary` violation triggers a rollback of the out-of-bounds change
+   before any correction is sent. A `budget` violation is a hard stop — see
+   below.
+4. **If nothing failed:** commit (if the phase specifies a commit), mark the
+   phase `success`, return.
+
+## Budget: checked first, dispatched separately
+
+This is worth its own callout because it changed behavior in a way that
+directly saved money on a real run. `budget_not_exceeded` sits in the same
+gate list as everything else, but it's evaluated for a `budget` kind
+specifically and short-circuits before the general retry path:
+
+```python
+# Budget is a hard stop, not a retryable violation. Every other gate here
+# fails for a reason a correction can plausibly fix. Money already spent
+# is not one of those: no reply the agent sends un-spends it.
+if budget_violation is not None:
+    self.trace.phase_ended(phase, "fail", budget_violation)
+    return _PhaseOutcome(False, usd, had_gate_failure)
+```
+
+Full story, including the real $5→$7.50 overspend this fixed, in
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget#across-the-whole-run-budget-is-a-hard-stop-not-a-retry).
+
+## `run()` — fresh vs. resumed, same loop
+
+```python
+async def run(self, task, run_id, bay, workflow,
+               resuming=False, start_index=0,
+               initial_envelopes=None, initial_usd=0.0):
+```
+
+`resuming` is the whole difference between a fresh run and a resume — and
+deliberately a *small* difference:
+
+- **Fresh:** insert `runs`/`bays` rows, start the loop at index `0`, nothing
+  carried forward.
+- **Resumed:** reopen an existing run row (`trace.run_resumed`), reactivate
+  the existing bay, enter the **same loop** at `start_index` with whatever
+  the caller reconstructed about the last completed phase.
+
+The loop itself doesn't know or care which happened — that's what keeps the
+repair logic, the budget gate, and the boundary checks identical either way.
+What differs is entirely in how `shipyard build --resume` computes
+`start_index` and `initial_envelopes` before calling `run()` — see
+[Trace &amp; Recovery](/architecture/trace-and-recovery) for that, including
+the one deliberate exception (the acceptor is never skipped, even if it
+already "succeeded").
+
+## Code-phase timeouts
+
+Code phases (running a shell command) are wrapped in
+`asyncio.wait_for(proc.communicate(), timeout=CODE_PHASE_TIMEOUT_S)` — a
+default 10-minute ceiling, so a hung subprocess can't hang the whole run
+silently. Agent-phase timeouts live in the adapter layer instead (each
+adapter's own `timeout_s`) — see [Model Adapters](/adapters).

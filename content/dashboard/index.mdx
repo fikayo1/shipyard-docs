@@ -1,0 +1,116 @@
+---
+title: The Yard View
+---
+
+# The dashboard (yard view)
+
+`shipyard/dashboard/server.py` — `ThreadingHTTPServer` from the standard
+library, one page (`page.html`, re-read from disk on every request so
+editing the UI is a browser refresh, not a restart), and a growing set of
+endpoints. Start it with `shipyard yard` — `http://localhost:4800` by
+default (`PORT` env var to change it). This page covers the yard view's own
+mechanics and internals; see [HTTP API Reference](/api) for the complete,
+current endpoint list — this same file now fronts nearly everything the CLI
+can do, not just resume/rerun/land.
+
+## The whole read transport is one query
+
+Live view and full history are the same `select * from events where rowid >
+? order by rowid limit N` at different polling cadence — no websocket, no
+separate ingest endpoint, no separate replay path. A reader that's been away
+an hour and a reader polling every 600ms run identical code, just with
+different cursors.
+
+**The primary object is the run and its phases, not the agent.** A
+dashboard whose rows are agents is a terminal multiplexer with better
+styling — you can see activity, but you can't ask which step failed. The
+agent is an attribute of a phase, never a row of its own.
+
+## It also writes, now — starting work, resuming/rerunning/landing/stopping a run, and more
+
+What began as three actions (resume, rerun, land) has grown into a real
+second front door onto nearly the whole CLI — starting brand-new work
+(`/api/intake`, `/api/builds`, `/api/iterate`), provisioning
+(`/api/setup/browser-tests`), governed extension proposals
+(`/api/extensions/*`), and per-run support chat and deployment approval.
+The full table lives on the [HTTP API Reference](/api) page rather than
+duplicated here; the point that matters for this page is unchanged:
+
+| Endpoint | Effect |
+|---|---|
+| `POST /api/run/<id>/resume` | spawns `shipyard build --resume <id>` as a subprocess |
+| `POST /api/run/<id>/rerun` | spawns `shipyard rerun <id>` as a subprocess |
+| `POST /api/run/<id>/stop` | signals whichever process owns this run, dashboard- or terminal-spawned |
+| `POST /api/run/<id>/land` | calls `BayManager.land_now()` directly — the same function `shipyard land` calls |
+| `GET /api/run/<id>/log` | tails a spawned resume/rerun's stdout+stderr |
+
+None of this is new capability — every endpoint spawns the exact CLI
+subcommand a terminal would run, or calls the exact library function that
+subcommand calls. This is a second front door, not a second implementation:
+**the guards a terminal user gets are the guards a browser (or any other
+HTTP caller) gets too**, because it's the literal same code path.
+
+### Resume and rerun spawn the real CLI
+
+```python
+CLI = [sys.executable, "-m", "shipyard.cli.__main__"]
+
+proc = subprocess.Popen(
+    [*CLI, *argv],
+    cwd=str(Path.cwd()),
+    env=os.environ.copy(),
+    stdout=log_file,
+    stderr=subprocess.STDOUT,
+    start_new_session=True,
+)
+```
+
+Two things worth knowing if a dashboard-triggered run behaves unexpectedly:
+
+- **`env=os.environ.copy()`** — the child inherits exactly the dashboard
+  process's own environment, nothing more. If the dashboard was started in
+  a terminal that never had (say) `SHIPYARD_OPENAI_BASE_URL` exported,
+  every resume/rerun it spawns fails on startup, even if builds run
+  directly from another terminal work fine. See
+  [Operator Secrets](/getting-started/operator-secrets) for the real
+  incident this caused and how to spot it (`started: true` in the API
+  response, but nothing ever shows up as running — check the log).
+- **A double-click is guarded**, not just debounced client-side: a
+  class-level `_active` dict, locked, refuses a second resume/rerun for the
+  same run while one is already in flight (`proc.poll() is None`), and
+  returns `409` rather than silently launching two.
+
+### Land calls the exact function `shipyard land` calls
+
+```python
+result = await bays.land_now(repo, bay_row["branch"])
+self.trace.bay_status(bay_row["bay_id"], "done", ended=True)
+```
+
+Same refusal conditions as the CLI command (not `--repo`, not `done`, not
+`held`), and the same fix for the same gap: without the `bay_status(...,
+"done", ...)` call after a successful merge, a landed bay stayed marked
+`held` forever and the dashboard kept offering to land something already
+landed.
+
+## Reconciliation on every poll
+
+`/api/yard` and `/api/run/<id>` both call
+`self.trace.reconcile_orphans(stale_after_s=RECONCILE_STALE_S)` before
+answering — `RECONCILE_STALE_S = 1800.0`. See
+[Trace &amp; Recovery](/architecture/trace-and-recovery#orphan-reconciliation)
+for why the dashboard specifically needs the staleness-aware version rather
+than the CLI's unconditional one: a build genuinely in progress can sit
+with zero new events for the length of one model call, and a shorter
+threshold would misdiagnose that as stuck.
+
+## `runs.status` and `bays.status` can diverge — the UI has to track both
+
+A run whose acceptance criteria fail flips `runs.status` to `failed` but
+never touches `bays.status`. The frontend's own change-detection
+(`signature()`) has to fingerprint both fields independently for exactly
+this reason — fingerprinting only one meant a run whose acceptance just
+failed could sit on screen with stale action buttons until some unrelated
+field happened to change. See
+[Trace &amp; Recovery](/architecture/trace-and-recovery#schema) for the
+full schema.

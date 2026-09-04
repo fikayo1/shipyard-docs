@@ -1,0 +1,92 @@
+---
+title: Testing Philosophy
+---
+
+# Testing a harness, not a script
+
+A pipeline that runs an LLM agent can't be tested the way a normal function
+is — the interesting failures are exactly the ones a mock would paper over:
+a model that returns malformed JSON, a correction that doesn't actually fix
+the violation, a subprocess that hangs instead of erroring, a bay whose
+worktree gets left dirty after a crash. Shipyard's own test suite (280
+tests, `pytest tests/`) is built around one rule: **fake the model, never
+fake the system around it.**
+
+## The `ScriptedAdapter` — the only way to test a harness at all
+
+Real model calls are non-deterministic, cost money, and take real time —
+none of which is acceptable for a test suite that runs on every commit. The
+`ScriptedAdapter` implements the exact same `Adapter` protocol
+(`open`/`send`/`correct`) as `ClaudeCodeAdapter` and
+`OpenAICompatibleAdapter`, but instead of calling out to a model it plays
+back a **pre-written script** of envelopes — one per turn, in order,
+including deliberately malformed ones to exercise the gate/correction path.
+
+This is the load-bearing idea in the whole test suite: because the adapter
+is swapped, not mocked out with a stub that returns `{"ok": true}`, every
+other component — the runner's retry loop, the gates, the trace writer, the
+bay lifecycle — runs its **real, production code path** against a scripted
+but structurally real response. A bug in `runner.py`'s correction logic
+would show up in these tests exactly the way it would show up in
+production, because the only thing different is where the envelope came
+from.
+
+```python
+class ScriptedAdapter:
+    """Plays back a fixed sequence of envelopes instead of calling a model."""
+
+    def __init__(self, script: list[dict], latency: bool = True) -> None:
+        self._script = list(script)
+        ...
+```
+
+A test that wants to prove "a budget violation fails the phase immediately,
+without retrying" (see [Retries, Repair &amp; Budget](/concepts/retries-and-budget))
+writes a script where every turn spends money, points the runner at it, and
+asserts on the real `RunResult` — not a mock's call count.
+
+## Real git repos, real HTTP servers — no mocking the environment either
+
+The same principle extends past the model. `tests/test_bay_land.py`
+provisions **actual git repositories** in a temp directory — real
+`git init`, real commits, real branches, real merges — rather than mocking
+`subprocess.run` calls to `git`. A bay's land operation either merges
+cleanly against a real repository or it doesn't; a mocked `git` command
+can't tell you which.
+
+Likewise, `tests/test_dashboard_server.py` starts the dashboard's actual
+`ThreadingHTTPServer` on a real (ephemeral) port and issues real HTTP
+requests against it with `urllib`/`requests` — not calling the handler's
+Python methods directly. A route that's wired up wrong (wrong method,
+wrong path, missing header handling) fails the test the same way it would
+fail a real browser, because it's exercised through the same interface a
+real browser uses.
+
+## What this buys, concretely
+
+- **A correction bug is caught, not assumed away.** If `runner.py` stopped
+  passing violations into the next turn's context, a scripted test whose
+  second envelope only succeeds *because* it saw the violation text would
+  fail — a stub adapter that just returns "success" on retry wouldn't
+  notice.
+- **Trace and dashboard tests exercise the real schema.** Because the SQLite
+  trace and the HTTP server are both real, a migration that breaks a query
+  breaks the test that queries it, not just the production code six months
+  later.
+- **The cost is zero and the suite is fast.** No network calls, no API
+  keys, no flakiness from a model provider's own latency — the entire
+  280-test suite runs in seconds, which is what makes it something a
+  developer actually runs before every commit rather than something CI
+  runs alone, hours later.
+
+## The honest limit
+
+A scripted adapter can prove the harness behaves correctly *given* a
+particular sequence of model outputs. It cannot prove a real model will
+produce sensible envelopes in the first place, or that two different real
+models won't share the same blind spot (see
+[`RoutingAdapter`](/adapters#routingadapter--different-owners-different-models-one-runner)
+for the direct answer to that second gap). Scripted tests are the
+foundation the harness is built and refactored against; they are not a
+substitute for the real, credentialed acceptance runs described in
+[Criteria &amp; Scorecards](/acceptance).

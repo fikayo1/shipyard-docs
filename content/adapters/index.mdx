@@ -1,0 +1,122 @@
+---
+title: Adapters & Model Routing
+---
+
+# Model adapters
+
+An `Adapter` is a small protocol: `open(sink) -> AgentSession`, and a
+session that can `send(request)` and `correct(violations)`. Everything the
+runner does — corrections into a live session, tool-call streaming, cost
+tracking — goes through this one interface, so swapping which model runs a
+phase never touches the runner.
+
+## `ClaudeCodeAdapter` — the real agent, via the CLI
+
+Spawns `claude -p` per turn rather than using an SDK, deliberately: the
+harness needs three things — run in a specific directory, stream tool calls
+live, and continue an existing session — and the CLI gives all three, uses
+whatever auth the operator already has, and doesn't pin the project to an
+SDK version.
+
+**How a correction actually works, and why it's cheap:** the first turn
+returns a `session_id`; every correction passes `--resume <session_id>`, so
+the model still has its own reasoning, the files it already read, and the
+mistake it just made. A cold restart would throw all of that away and
+re-derive it at full token cost — a correction is one message, not one
+context window.
+
+Two settings worth knowing before touching them, both learned from real
+runs:
+
+<Callout type="warning">
+  **`permission_mode: "default"` is a hang in headless mode**, not a safety
+  feature. It asks a human to approve each tool call; there's no human, so
+  the agent waits for an approval that can never arrive and the phase dies
+  on its 20-minute timeout — which presents as a network fault, and that's
+  the wrong place to go looking.
+</Callout>
+
+<Callout type="info">
+  **`"acceptEdits"` (the default) does not auto-approve every `Bash` call.**
+  A reviewer that needs to run the real test suite to form an independent
+  opinion may find it can't, and will quietly fall back to trusting the
+  builder's own claims — which defeats the entire point of an independent
+  review phase. Per-phase tool policy is the real fix; it isn't built yet.
+</Callout>
+
+## `OpenAICompatibleAdapter` — chat-completions plus a hand-rolled tool loop
+
+A raw chat-completions endpoint can only return text or ask to call a
+function — none of an agentic loop's Read/Write/Edit/Bash comes for free
+the way it does with the Claude Code CLI. This adapter implements that
+bounded tool set itself (via OpenAI-style function calling), executes each
+call against the bay's own worktree, and feeds the result back — same
+"agent proposes, code disposes" shape, just implemented one layer lower
+because there's no CLI doing it underneath.
+
+**Real cost, not an estimate.** The chat-completions response carries token
+counts, not a price — this adapter deliberately doesn't maintain a second
+copy of a pricing table that correctly lives on the proxy instead. What the
+proxy *is* positioned to know, because it's the thing that actually billed
+the call, is the real dollar cost. A LiteLLM proxy reports it, unprompted,
+on every response via an `x-litellm-response-cost` header; this adapter
+reads that header and accumulates it across every round-trip in a phase.
+The honest residual gap: a proxy that doesn't set that header (a bare
+OpenAI endpoint, a different gateway's convention) reports `usd: 0.0` — not
+a fabricated number, a real, visible zero.
+
+## `RoutingAdapter` — different owners, different models, one `Runner`
+
+`Runner` takes exactly one `Adapter` for a whole run, and an
+`AgentRequest.owner` is only known once `session.send()` is actually
+called. So "route the builder to one model and the reviewer to another"
+can't be a property of a single adapter — it has to be something that
+*looks like* one adapter to the runner while privately holding several.
+That's `RoutingAdapter`: a dict of adapters keyed by owner, with a
+`default` fallback for anything not explicitly routed.
+
+Routing happens **per phase, not per model call within a phase** —
+deliberately, because a correction is a continuation of the same
+conversation, and switching models mid-phase would silently throw away
+exactly the context a correction exists to preserve.
+
+This closes a real, named gap from the project's own honest-limitations
+list: **correlated blind spots**. A builder and a reviewer on the same
+model family share the same wrong assumptions — structural independence
+(different phases, different boundaries) is not formal independence.
+Routing the reviewer to a genuinely different model family is the direct
+answer, not just a cost trick. Configure it per-topology:
+
+```yaml
+models:
+  builder: claude:sonnet
+  reviewer: openai:gpt-5.6-luna
+```
+
+## Model tiers — intent, not a vendor string, in the topology file
+
+```yaml
+models:
+  reviewer: premium
+```
+
+`"premium"` resolves to the real `vendor:model` spec named by the
+`SHIPYARD_MODEL_PREMIUM` environment variable — not hardcoded into the
+topology. The reasoning, from `_resolve_tier`'s own docstring:
+
+> A topology that names `"openai:gpt-5.6-sol"` directly goes stale the day
+> that model is renamed or retired, and every topology that mentioned it
+> needs a synchronized edit. A topology that names `"premium"` is declaring
+> *intent* — this owner needs the best available reasoning, this one
+> doesn't — and what `"premium"` resolves to today is one environment
+> variable, changed once, felt by every topology that uses it.
+
+**Unset tiers are never a silent downgrade.** Until an operator actually
+exports `SHIPYARD_MODEL_STANDARD` or `SHIPYARD_MODEL_ECONOMY`, every tier
+resolves to the same default provider/model the whole run already uses —
+so turning tiering *on* in a topology's `models:` map changes nothing until
+someone deliberately points a cheaper tier at a cheaper model.
+
+Anything that isn't a recognized tier name passes through unchanged, so a
+topology naming a real spec directly (`"claude:sonnet"` — the only form
+this ever supported before tiers existed) keeps working exactly as it did.

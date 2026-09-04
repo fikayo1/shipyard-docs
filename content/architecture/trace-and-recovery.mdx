@@ -1,0 +1,144 @@
+---
+title: Trace & Recovery
+---
+
+# Trace & recovery
+
+`shipyard/core/trace.py` — one SQLite database (`.shipyard/trace.db`, WAL
+mode, `check_same_thread=False` so request threads can read while a runner
+in another process writes), five tables, no separate ingest path. The
+dashboard, `shipyard runs`, and a resume all read the same rows a build
+wrote as it happened.
+
+## Schema
+
+```sql
+create table runs (
+  run_id, task_id, shape, topology, request, autonomy, status,
+  started_at, ended_at, usd, tokens_in, tokens_out,
+  phases_run, gate_fails, corrections, inputs
+);
+
+create table bays (
+  bay_id, run_id, status, worktree, branch, created_at, ended_at
+);
+
+create table phases (
+  phase_id, run_id, seq, name, kind, owner, description, status,
+  attempt, error, model, usd, tokens_in, tokens_out, started_at, ended_at
+);
+
+create table gate_results (
+  id, run_id, phase_id, gate, passed, checks, at
+);
+
+create table events (
+  rowid_alias, run_id, phase_name, kind, message, data, at
+);
+```
+
+`runs.status` and `bays.status` are **two different claims that can
+diverge** — worth knowing before querying either in isolation. A run whose
+acceptance criteria fail gets `runs.status = 'failed'`, but that doesn't
+touch `bays.status` at all; a bay only moves through
+`provisioning → running → held/done/failed/interrupted` via its own
+landing-policy path. The dashboard's frontend change-detection has to track
+both fields independently for exactly this reason — tracking only one meant
+a run whose acceptance just failed could sit on screen without the UI
+re-rendering, since nothing about `bays.status` had changed.
+
+Every `gate_results.checks` entry carries a machine-readable `kind`
+(`boundary`, `budget`, `claim`, `consistency`, `command`), so the trace
+answers "what *kind* of thing went wrong" without string-matching on prose:
+
+```sql
+select p.name, j.value ->> 'item', j.value ->> 'note'
+from gate_results g, json_each(g.checks) j
+join phases p on p.phase_id = g.phase_id
+where j.value ->> 'ok' = 0 and j.value ->> 'kind' = 'boundary';
+```
+
+## Orphan reconciliation
+
+A process that dies mid-flight (crash, `kill -9`, a Ctrl-C that lands
+outside the `KeyboardInterrupt` handler) leaves its run row — and any phase
+still `running` underneath it — exactly as it was at the moment of death: a
+permanent false claim that work is still in flight. `reconcile_orphans()`
+fixes this, but its safety story depends entirely on **who's calling it and
+how often**:
+
+```python
+def reconcile_orphans(self, stale_after_s: float | None = None) -> list[str]:
+```
+
+With the default `stale_after_s=None`, **every** row still marked `running`
+is reconciled unconditionally. That's safe only for a caller like `shipyard
+build`'s or `shipyard runs`'s own startup — a one-shot CLI invocation,
+called *before that process has inserted a single row of its own*, so it
+can only ever see rows left by some earlier, presumably-dead process.
+
+That assumption breaks the moment something calls this **repeatedly while a
+real run might still be genuinely active next to it** — which is exactly
+the dashboard's situation, polling in a loop. Nothing distinguishes
+"abandoned" from "still being worked on right now" except the presence of
+recent events, so the dashboard passes a real `stale_after_s` (1800
+seconds): a `running` row is only reconciled once no event for it has
+landed in that long. That threshold is deliberately longer than
+`OpenAICompatibleAdapter`'s own 20-minute default request timeout, because
+a single in-flight model call can legitimately produce zero trace events
+for the entire span of the call — a shorter threshold would "reconcile" a
+build that was never actually stuck.
+
+This *never* touches the bay's worktree — reconciliation is trace-only. The
+git worktree and its commits stay exactly where they were, which is what
+makes `--resume` possible afterward: the record now honestly says
+`interrupted`, and the actual work is still on disk to resume into.
+
+## What `--resume` actually re-enters
+
+`_resume_existing_run()` (`shipyard/cli/build.py`) computes which phases to
+skip by checking which ones already have `status == 'success'` — **with one
+deliberate, load-bearing exception**:
+
+```python
+# "accept" is excluded even when it already succeeded AS A PHASE. A phase
+# succeeding and its VERDICT still being true are different claims. The
+# acceptor ran cleanly and correctly ruled "5 of 13 fail, no GitHub
+# credentials available" — that is exactly the kind of result an operator
+# resumes TO FIX, by exporting the credentials and asking for a fresh
+# ruling.
+completed_names = [n for n in completed_names if n != "accept"]
+```
+
+This was a real bug, found and fixed while building resume: because
+`Runner.run()` starts a resume with an **empty** `envelopes` dict, skipping
+an already-"successful" accept phase didn't just skip re-verification — it
+made `out.envelopes.get("accept")` come back `None`, which the CLI's own
+`main()` read as *"no scorecard, therefore accepted"*. A resumed run could
+report success it never re-earned. Reverting the one-line fix made two
+regression tests fail immediately, confirming it's load-bearing.
+
+Two more things worth knowing about resume's reconstruction:
+
+- **A missing bay refuses cleanly, rather than guessing.** If the bay's
+  worktree no longer exists on disk (bays live in the system temp
+  directory and don't survive a reboot or a temp-dir cleanup), resume
+  refuses with a message pointing at `shipyard rerun` instead.
+- **A stale workflow shape restarts from the top, not a wrong phase.** If a
+  phase named in the trace can't be found in the *current* workflow (it was
+  renamed or removed since this run started), resume doesn't guess which
+  phase it might correspond to — that could silently skip real work — it
+  restarts the graph from index `0` instead. The bay's own commits are
+  untouched either way.
+- **A named, real gap in what's reconstructed:** the trace records a
+  phase's `summary` and `artifacts` list (via its `envelope_parsed` event),
+  not the full typed envelope object. Resume rebuilds the base `Envelope`
+  shape from that, not an output-type-specific subclass. A phase whose
+  prompt depends on a subclass-only field from before the crash won't see
+  it. This doesn't affect the common case — the fields every phase actually
+  reads off `previous` (`status`/`summary`/`artifacts`) survive — but it's a
+  real, named limitation, not an oversight nobody noticed.
+
+See [The `run` Command Reference](/cli#--resume-run-id) for the operator-facing
+summary, and [Retries, Repair &amp; Budget](/concepts/retries-and-budget)
+for what happens once a resumed phase actually runs.

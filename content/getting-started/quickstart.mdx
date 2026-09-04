@@ -1,0 +1,103 @@
+---
+title: 'Quickstart: demo → new → build'
+---
+
+# Quickstart
+
+Three steps, in order of increasing cost: a free scripted demo, then a real
+intake conversation, then a real build.
+
+## 1. The demo — no API key, no cost
+
+```bash
+python examples/demo.py               # four bays, running in parallel
+python -m shipyard.cli.__main__ yard   # the yard view, http://localhost:4800
+```
+
+(Or, if `shipyard` is on `PATH` from the editable install: `shipyard demo`
+and `shipyard yard` in two terminals.)
+
+The demo drives a **scripted** agent — it replays a fixed script rather than
+calling a real model, so it needs no API key and never touches anything
+outside `.shipyard/` and the system temp directory. Its whole point is to
+demonstrate the harness's own behavior under a misbehaving agent, which
+you cannot ask a real model to do on cue.
+
+### What to actually look at
+
+One of the four demo bays deliberately writes to a protected path on its
+first attempt. In the trace and the yard view, that shows up as:
+
+```
+build  envelope_parsed    implemented scoring and adjusted the topology
+build  correction_issued  topologies/api-service/topology.yaml: wrote to a
+                          protected path — rolled back
+build  envelope_parsed    reimplemented scoring, inside the boundary this time
+build  phase_ended        build passed          <- attempt 2, same session
+```
+
+That's half the thesis: the violation is caught by diffing the repo, the
+change is undone, the correction goes back into the **live** session (not a
+restart), and the run continues.
+
+The other half is the pair of bays either side of it — a controlled
+comparison. Same workflow, same autonomy tier, same `merge` landing policy,
+same repo shape. The only difference: one bay violated a boundary once and
+recovered; the other never did. Both finish **green**, but they land
+differently:
+
+```
+✓ existing repo · boundary violation    landing=HOLD    a gate failed in this run
+                                                          — landing demoted to hold
+✓ existing repo · well-behaved          landing=MERGED  fast-forwarded into baseRef
+```
+
+Passing every gate *eventually* does not earn an unattended landing. That
+demotion is the circuit breaker, and it's the point of the demo — the demo
+is considered broken if that contrast ever stops happening.
+
+## 2. A real intake conversation
+
+```bash
+shipyard new "a bookmark API where I save URLs with tags"
+```
+
+Needs Claude Code installed and authenticated (`claude` on `PATH`). This
+interviews you and writes `spec.md` + `criteria.json` — the two inputs
+`shipyard build` reads. See [Core Concepts](/concepts) for what those two
+files actually are and why criteria are compiled at intake rather than left
+to the acceptor to invent later.
+
+## 3. A real build
+
+```bash
+shipyard build --spec spec.md --criteria criteria.json \
+  --verify "pytest" --budget 5 --tier 2
+```
+
+<Callout type="warning">
+  **Set `--verify` to your real test command.** It defaults to a bare file
+  check, and until you change it the verify phase is theatre — it will pass
+  on code that doesn't run. The CLI says so out loud at startup rather than
+  letting a green tick lie.
+</Callout>
+
+Useful flags: `--topology` (usually auto-selected from `criteria.json`),
+`--repo <path>` (work in an existing repo instead of greenfield), `--model`,
+`--tier 0..3`, `--budget <usd>`. Run `shipyard build --help` for the full,
+current list — flags are added faster than any doc can track by hand.
+
+The run happens in a throwaway git worktree under the system temp directory,
+so a misbehaving agent can't touch your working tree. At the lower autonomy
+tiers, the result is **held** for you to review rather than merged — see
+[Bays, Worktrees &amp; Landing](/architecture/bays-and-landing) and
+[`shipyard land`](/cli#shipyard-land).
+
+## Watching it live
+
+Run `shipyard yard` in one terminal before (or during) a build in another.
+The dashboard polls the same trace database the build is writing to, so
+there's no separate ingest path — a reader that's been away an hour and a
+reader polling every 600ms run identical code, just with different cursors.
+See [Dashboard](/dashboard) for what it can do beyond watching — including
+resuming, restarting, and landing a run straight from the browser.
