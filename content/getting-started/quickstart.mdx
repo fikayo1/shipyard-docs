@@ -4,69 +4,71 @@ title: 'Quickstart: demo → new → build'
 
 # Quickstart
 
-Three steps, in order of increasing cost: a free scripted demo, then a real
-intake conversation, then a real build.
+Three steps, in order of increasing cost: a free scripted demo, a real
+request, then a real build. Everything here works the same whether you type
+it at a terminal or click it in the yard (`shipyard yard`,
+`http://localhost:4800`) — this page uses the terminal because it's easiest
+to follow in a doc.
 
 ## 1. The demo — no API key, no cost
 
 ```bash
-python examples/demo.py               # four bays, running in parallel
-python -m shipyard.cli.__main__ yard   # the yard view, http://localhost:4800
+shipyard demo     # four bays, running in parallel
+shipyard yard      # watch them at http://localhost:4800
 ```
 
-(Or, if `shipyard` is on `PATH` from the editable install: `shipyard demo`
-and `shipyard yard` in two terminals.)
+The demo plays back a **scripted** agent instead of calling a real model, so
+it costs nothing and touches nothing outside a throwaway directory. Its job
+is to show you the harness's own behavior under a misbehaving agent —
+something you can't ask a real model to do reliably on cue.
 
-The demo drives a **scripted** agent — it replays a fixed script rather than
-calling a real model, so it needs no API key and never touches anything
-outside `.shipyard/` and the system temp directory. Its whole point is to
-demonstrate the harness's own behavior under a misbehaving agent, which
-you cannot ask a real model to do on cue.
+### What to expect
 
-### What to actually look at
-
-One of the four demo bays deliberately writes to a protected path on its
-first attempt. In the trace and the yard view, that shows up as:
+One of the four demo runs deliberately writes somewhere it isn't allowed to,
+on its first attempt. Watching that one in the yard (or the trace) shows:
 
 ```
 build  envelope_parsed    implemented scoring and adjusted the topology
-build  correction_issued  topologies/api-service/topology.yaml: wrote to a
-                          protected path — rolled back
+build  correction_issued  wrote to a protected path — rolled back
 build  envelope_parsed    reimplemented scoring, inside the boundary this time
-build  phase_ended        build passed          <- attempt 2, same session
+build  phase_ended        build passed          <- second attempt, same session
 ```
 
-That's half the thesis: the violation is caught by diffing the repo, the
-change is undone, the correction goes back into the **live** session (not a
-restart), and the run continues.
+The violation gets caught, undone, and the same agent is told exactly what
+went wrong and tries again — it isn't restarted from scratch. That's the
+core promise: a mistake becomes a correction, not a do-over.
 
-The other half is the pair of bays either side of it — a controlled
-comparison. Same workflow, same autonomy tier, same `merge` landing policy,
-same repo shape. The only difference: one bay violated a boundary once and
-recovered; the other never did. Both finish **green**, but they land
+The other three runs are a controlled comparison — same everything, except
+one of them never violated a boundary. Both finish **green**, but they land
 differently:
 
 ```
-✓ existing repo · boundary violation    landing=HOLD    a gate failed in this run
-                                                          — landing demoted to hold
-✓ existing repo · well-behaved          landing=MERGED  fast-forwarded into baseRef
+✓ boundary violation, then recovered    →  held for a human to look at
+✓ never violated anything               →  merged automatically
 ```
 
-Passing every gate *eventually* does not earn an unattended landing. That
-demotion is the circuit breaker, and it's the point of the demo — the demo
-is considered broken if that contrast ever stops happening.
+Passing every check *eventually* still doesn't earn an unattended landing —
+that's deliberate, and it's the thing to notice in the demo.
 
-## 2. A real intake conversation
+## 2. A real request
 
 ```bash
 shipyard new "a bookmark API where I save URLs with tags"
 ```
 
-Needs Claude Code installed and authenticated (`claude` on `PATH`). This
-interviews you and writes `spec.md` + `criteria.json` — the two inputs
-`shipyard build` reads. See [Core Concepts](/concepts) for what those two
-files actually are and why criteria are compiled at intake rather than left
-to the acceptor to invent later.
+Needs Claude Code installed and authenticated (`claude` on `PATH`) — or an
+OpenAI-compatible provider, see [Operator Secrets](/getting-started/operator-secrets).
+This interviews you about anything genuinely ambiguous, then writes
+`spec.md` and `criteria.json` — the request and the checklist the finished
+product will be judged against. See
+[How a Request Becomes Software](/concepts) for what those two files are
+for.
+
+**Extending something that already exists, instead of starting fresh?**
+Use `shipyard iterate <repo> "<what should change>"` instead of `new` — it
+reads the existing repository first so the request and its criteria are
+grounded in what's actually there. See
+[`shipyard iterate`](/cli#shipyard-iterate-repo-intent).
 
 ## 3. A real build
 
@@ -76,28 +78,37 @@ shipyard build --spec spec.md --criteria criteria.json \
 ```
 
 <Callout type="warning">
-  **Set `--verify` to your real test command.** It defaults to a bare file
-  check, and until you change it the verify phase is theatre — it will pass
-  on code that doesn't run. The CLI says so out loud at startup rather than
-  letting a green tick lie.
+  **Set `--verify` to your real test command.** Left at its default, the
+  verify step is theatre — it'll pass on code that doesn't run. Shipyard
+  says so out loud at startup rather than showing you a green check that
+  lied.
 </Callout>
 
-Useful flags: `--topology` (usually auto-selected from `criteria.json`),
-`--repo <path>` (work in an existing repo instead of greenfield), `--model`,
-`--tier 0..3`, `--budget <usd>`. Run `shipyard build --help` for the full,
-current list — flags are added faster than any doc can track by hand.
+Useful flags: `--topology` (usually picked automatically from
+`criteria.json`), `--repo <path>` (build into an existing repo instead of a
+brand-new one), `--model`, `--tier 0..3` (how much gets landed
+automatically versus held for you), `--budget <usd>`. `shipyard build
+--help` has the full, current list.
 
-The run happens in a throwaway git worktree under the system temp directory,
-so a misbehaving agent can't touch your working tree. At the lower autonomy
-tiers, the result is **held** for you to review rather than merged — see
-[Bays, Worktrees &amp; Landing](/architecture/bays-and-landing) and
-[`shipyard land`](/cli#shipyard-land).
+The build happens in its own throwaway copy of the repo, so nothing it does
+can touch your real working tree while it's in progress. At lower autonomy
+tiers the result is **held** for you to review rather than merged
+automatically — see [Reviewing & Landing](/architecture/bays-and-landing)
+and [`shipyard land`](/cli#shipyard-land-run-id).
 
 ## Watching it live
 
-Run `shipyard yard` in one terminal before (or during) a build in another.
-The dashboard polls the same trace database the build is writing to, so
-there's no separate ingest path — a reader that's been away an hour and a
-reader polling every 600ms run identical code, just with different cursors.
-See [Dashboard](/dashboard) for what it can do beyond watching — including
-resuming, restarting, and landing a run straight from the browser.
+Run `shipyard yard` any time before or during a build — it reads the same
+run history the build is writing to, live.
+
+<figure>
+  <img src="/images/yard-run-grid.png" alt="The yard's run grid: cards for each run showing its topology, phase progress, status badge (held, interrupted, done), cost, duration, and gate/correction counts, with resume and restart buttons." />
+  <figcaption>Every run you've started, newest first — click any card for its full timeline.</figcaption>
+</figure>
+
+Each card is one run: which phases have finished (the row of green bars),
+its status (`held` waiting on you, `interrupted`, or `done`), what it cost,
+how long it took, and how many gate failures or corrections happened along
+the way. `resume` picks an interrupted or budget-paused run back up;
+`restart` runs it again from scratch. See [The Yard](/dashboard) for what
+every screen and badge means.

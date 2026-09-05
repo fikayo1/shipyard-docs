@@ -4,90 +4,95 @@ title: Introduction
 
 # Shipyard
 
-Shipyard is a **deterministic-harness software factory**. It takes a bounded
-software request, turns it into an explicit phase graph, and runs that graph
-through code-owned sequencing, gates, and acceptance checks — with an LLM
-agent doing the work *inside* each phase, never deciding what happens
-*between* phases.
+Shipyard turns a plain-English request into working software. You describe
+what you want; Shipyard interviews you, writes a spec, then plans, builds,
+tests, reviews, and ships it — landing real commits in a real repository,
+not a transcript of an agent "trying its best."
+
+The difference from just prompting a coding agent yourself: every step in
+between is run by ordinary code, not by the model. The model does the
+writing, inside one bounded step at a time. Code decides what happens next,
+checks the model's work against the actual filesystem and test suite before
+trusting it, and writes down everything that happened so you (or anyone
+else) can see exactly why a run passed, failed, or is waiting on you.
 
 <Callout type="info">
-  This is a living document. It is updated as Shipyard changes — treat any
-  page here as accurate as of its last edit, not as a permanent spec.
+  This is a living document, updated as Shipyard changes — treat any page
+  here as accurate as of its last edit, not as a permanent spec.
 </Callout>
 
-## The one rule everything else falls out of
+## Three ways to drive it
 
-Shipyard's `runner.py` states its own design principle better than a
-paraphrase would:
+Pick whichever fits how you're working right now — they're the same engine
+underneath, so nothing you do in one is unavailable in another.
 
-> **Code owns sequencing, retries, and acceptance; the agent owns only the
-> work inside one bounded phase.**
+- **The terminal.** `shipyard new "..."` then `shipyard build`. The fastest
+  way to kick something off or script it. See [CLI Reference](/cli).
+- **The yard — a browser dashboard.** Start it with `shipyard yard`, open
+  `http://localhost:4800`. Fill in a request, watch phases run as they
+  happen, resume a paused run, or land a finished one — all from a page
+  instead of a terminal. See [The Yard](/dashboard).
+- **An HTTP API.** The same actions as `curl` calls or from another
+  program — useful for kicking off a build from CI, from a script, or from
+  another agent. See [HTTP API](/api).
 
-Every other design decision in the codebase is a consequence of that one
-line:
+<figure>
+  <img src="/images/yard-new-work.png" alt="The yard's new-work screen: a request form, a list of drafts, and a starting-point choice between a new product and an existing repository." />
+  <figcaption>Starting new work from the yard — the same request `shipyard new` takes on the command line.</figcaption>
+</figure>
 
-- **Success must be earned.** Every phase starts `failed` and only a clean
-  exit, a validated envelope, and green gates flip it to `success`. Nothing
-  defaults to passing.
-- **A gate failure is a correction into the same live session, never a
-  restart.** The agent keeps its context and is told exactly what was wrong.
-- **The `writes` boundary is enforced by diffing the repository**, not by
-  asking nicely. A reviewer that is never handed `Write` still can't be
-  trusted not to try — so the harness diffs the actual filesystem after every
-  phase and rolls back anything outside the declared boundary.
-- **A code phase reports through the same envelope shape as an agent
-  phase**, so the repair loop is identical either way — the runner doesn't
-  need two versions of its own retry logic.
+## The journey, once you've made a request
 
-## Why a deterministic harness, and not a more flexible one
+1. **Intake.** You describe the outcome you want. Shipyard asks follow-up
+   questions where it's genuinely ambiguous, then writes a spec and a list
+   of acceptance criteria — the concrete, checkable claims "done" will be
+   judged against.
+2. **Build.** A planner lays out the work, a builder writes it, in an
+   isolated copy of the repo (a *bay*) so nothing touches your real working
+   tree while it's in progress.
+3. **Verify & review.** Real commands run — your test suite, a build, a
+   linter — and a reviewer checks the result against the request, not just
+   against whether tests happened to pass.
+4. **Accept.** Every criterion from step 1 gets ruled on individually, with
+   evidence — a passing test, a file that exists, a command that ran clean —
+   never just an agent's say-so that it's done.
+5. **Land.** A finished, accepted run either merges straight into your
+   repository (if you told it that's safe) or is held for you to look at
+   first — your call, made explicit up front rather than discovered after
+   the fact.
 
-An LLM can, in principle, produce almost anything — which makes "a harness
-for any software" an ill-posed problem, not a hard one. Shipyard's own
-`topology.py` module docstring puts this in terms of Ashby's Law:
+You can watch this whole sequence happen live in the yard — see the
+screenshot above, and [The Yard](/dashboard) for what each screen means.
 
-> A regulator must have at least as much variety as the system it governs.
-> [...] Committing to a topology is the variety-reduction move that makes a
-> complete harness achievable.
+## What you can count on, every run
 
-Concretely: Shipyard does not attempt to build "any software." It commits to
-a small, closed set of **topologies** — declared shapes of stack, boundaries,
-and gates (see [Topologies](/topologies)) — and only builds things that fit
-one. That's a deliberate trade: less flexibility, in exchange for a harness
-whose guarantees (boundaries enforced, gates real, acceptance evidence-backed)
-actually hold, instead of being aspirational.
-
-## The five things a run always has
-
-Whatever topology is in play, every Shipyard run produces the same five
-things, because they come from the runner and the trace, not from the
-topology or the agent:
-
-1. **A phase graph** — an explicit sequence of typed phases (`plan`,
-   `bootstrap`, `build`, `verify`, `review`, `accept`, and so on), each with a
-   declared owner, boundary, and gates. See [Core Concepts](/concepts).
-2. **Deterministic gates** — boundary checks, budget checks, and
-   topology-declared sensors, all evaluated by code against the agent's
-   output, never taken on the agent's word. See
-   [Runner &amp; Gates](/architecture/runner).
-3. **Bounded retries** — a correctable violation goes back into the same
-   session with what was wrong; a repeated identical failure or an
-   over-budget run stops instead of looping. See
-   [Retries &amp; the Repair Loop](/architecture/runner#the-repair-loop).
-4. **An isolated workspace** — every run gets its own git worktree (a
-   *bay*), so in-progress work never touches a shared checkout. See
-   [Bays, Worktrees &amp; Landing](/architecture/bays-and-landing).
-5. **A durable trace** — every phase, gate result, correction, and dollar
-   spent is written to SQLite as it happens, queryable live or after the
-   fact. See [Trace &amp; Recovery](/architecture/trace-and-recovery).
+- **Nothing is trusted on the model's word.** A claim like "I changed these
+  three files" or "this test passes" is checked against the real
+  filesystem and a real command exit code before anything downstream relies
+  on it.
+- **A mistake is corrected, not restarted.** If a check fails in a way that
+  can be fixed, the same agent gets told exactly what was wrong and tries
+  again in the same session — it doesn't lose its work and start over.
+- **A run can't wander outside its lane.** Each step in the process is only
+  allowed to touch certain files. An attempt to write somewhere it
+  shouldn't is caught and rolled back, automatically.
+- **Nothing vanishes if something goes wrong.** An interruption, a budget
+  limit, or a crash leaves a resumable, inspectable record behind — see
+  [Getting Started](/getting-started) and [The Yard](/dashboard) for how to
+  pick a paused or failed run back up.
+- **You decide what's safe to land unattended.** Anything outside what
+  you've explicitly marked safe is held for your review before it touches
+  your real repository.
 
 ## Where to go next
 
-- New to the codebase? Start with [Getting Started](/getting-started) to get
-  a clean environment running and `shipyard demo` producing scripted bays
-  with no API key and no cost.
-- Want the mental model before touching code? Read
-  [Core Concepts](/concepts) — phases, envelopes, gates, budget, and bays,
-  the five ideas everything else composes from.
-- Curious what's actually been decided, fixed, and found while building this
-  — including real bugs caught in production use — see
-  [Architecture](/architecture) and [Testing Philosophy](/testing).
+- **New here?** [Getting Started](/getting-started) gets you from nothing
+  to a landed feature, starting with a free run that costs nothing and
+  needs no credentials.
+- **Want to see what it looks like day to day?** [The Yard](/dashboard)
+  walks through the actual dashboard screens.
+- **Driving it from code or CI?** [HTTP API](/api).
+- **Wondering what kind of product it can build?** [What You Can Build](/topologies).
+- **Curious how it works underneath**, including honest limitations found
+  building real products with it — see [Architecture](/architecture) and
+  [Testing Philosophy](/testing).

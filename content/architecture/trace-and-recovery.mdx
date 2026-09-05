@@ -6,9 +6,21 @@ title: Trace & Recovery
 
 `shipyard/core/trace.py` — one SQLite database (`.shipyard/trace.db`, WAL
 mode, `check_same_thread=False` so request threads can read while a runner
-in another process writes), five tables, no separate ingest path. The
+in another process writes), eleven tables, no separate ingest path. The
 dashboard, `shipyard runs`, and a resume all read the same rows a build
 wrote as it happened.
+
+Five of the eleven are the core waterfall — `runs`, `bays`, `phases`,
+`gate_results`, `events` — shown below. The rest layer on top of it:
+`phase_checkpoints` and `criterion_checkpoints` (continuation state for
+[checkpointed resume](#checkpointed-resume)), `handoffs` (a record of every
+`iterate` handoff artifact written for a run — see
+[the CLI's iterate section](/cli#shipyard-iterate-repo-intent)),
+`trace_artifacts` (overflow storage for anything too large for an event's
+inline `data`, such as a full failed-verification command's output), and
+`support_messages`/`support_actions` (per-run support chat and deployment
+approvals — see [The Yard View](/dashboard) and the
+[HTTP API Reference](/api)).
 
 ## Schema
 
@@ -138,6 +150,77 @@ Two more things worth knowing about resume's reconstruction:
   it. This doesn't affect the common case — the fields every phase actually
   reads off `previous` (`status`/`summary`/`artifacts`) survive — but it's a
   real, named limitation, not an oversight nobody noticed.
+
+## Checkpointed resume
+
+Skipping already-`success` phases (above) is coarse — it re-enters at a
+phase boundary. A **checkpoint** is finer: compact, validated continuation
+state saved *inside* a phase, at the first safe point after an agent
+response is real but before anything downstream (gates, commit, the next
+phase) has acted on it.
+
+```python
+self.trace.checkpoint(
+    phase.run_id, phase.params.name,
+    reason="validated agent response before gates",
+    state=checkpoint_state, snapshot=await self.bays.snapshot(bay),
+)
+```
+
+Two checkpoints are saved per successful agent phase — one right after the
+typed envelope parses (the earliest point a paused run can resume from
+without re-paying for the same model call), and one again once the phase
+fully completes (`remaining_work: "proceed to the next phase"`). Only the
+newest checkpoint for a given phase is ever read back.
+
+**A checkpoint is a claim about a specific bay state, and it's validated,
+never assumed.** Every checkpoint carries a `snapshot` of the bay at the
+moment it was saved; before resume reuses one, `bays.snapshot_matches()`
+checks the *current* bay still matches it. If the bay diverged — a
+different `--resume` already ran, someone touched the worktree by hand —
+the checkpoint is refused rather than replayed against state it no longer
+describes, and resume falls back to re-entering that phase from scratch. A
+missing checkpoint (an older run, from before this feature existed) gets
+the same clean fallback. Either way, the operator sees why:
+
+```
+checkpoint  resuming 'build' from validated checkpoint 2
+checkpoint  checkpoint could not be validated against the current bay; re-running 'accept'
+```
+
+### Acceptance criteria checkpoint individually
+
+Acceptance is the one agent phase whose output is independently useful
+criterion-by-criterion, not just as one all-or-nothing envelope. Each ruled
+criterion is checkpointed separately (`criterion_checkpoints`), keyed to a
+fingerprint of the exact bay state it was ruled against — so a partial
+acceptance run (say, a provider timeout after ruling 9 of 13 criteria) can
+resume by reusing the 9 fresh, passing verdicts and asking the acceptor for
+only the remaining 4, rather than re-running (and re-paying for) all 13.
+
+This reuse is **deliberately narrow**: only verdicts checkpointed within
+`DEFAULT_ACCEPTANCE_CHECKPOINT_TTL_S` (5 minutes) are eligible, and only
+against a bay-state fingerprint that still matches exactly.
+
+<Callout type="info">
+  Five minutes is a narrow crash/restart recovery window, not permission to
+  treat yesterday's browser or provider result as a fresh acceptance
+  verdict. External systems — a deployed preview, a third-party API — can
+  change even when Git does not, so a stale-but-Git-identical bay is still
+  not safe to trust indefinitely.
+</Callout>
+
+### Budget pauses now checkpoint instead of just failing
+
+The runner's own budget gate (see
+[Retries, Repair &amp; Budget](/concepts/retries-and-budget#across-the-whole-run-budget-is-a-hard-stop-not-a-retry))
+ends a phase with `status = 'paused_budget'` rather than `'fail'` when spend
+crosses the ceiling — and because the checkpoint above is saved right after
+the agent's response parses, the work that budget already paid for survives
+the pause intact. `--resume` (with a higher `--budget`) picks it back up
+from there instead of re-running, and re-paying for, the same call. See
+that page for the full story, including the real incident that motivated
+checking budget first and un-retryably.
 
 See [The `run` Command Reference](/cli#--resume-run-id) for the operator-facing
 summary, and [Retries, Repair &amp; Budget](/concepts/retries-and-budget)

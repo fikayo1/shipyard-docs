@@ -2,131 +2,88 @@
 title: Phases, Envelopes & Gates
 ---
 
-# Core concepts
+# How a request becomes software
 
-Five ideas compose to make up everything Shipyard does. In dependency order:
+Five ideas explain everything you'll see happen after you submit a
+request — in the terminal, in the yard, or over the API. In the order
+they matter:
 
-## 1. The phase graph
+## 1. A run is a sequence of phases
 
-A **workflow** is an ordered list of **phases** (`shipyard/core/runner.py`'s
-`Workflow`/`AgentPhaseSpec`/`EngineerPhaseSpec` types). Each phase has:
+A **phase** is one bounded step with one clear owner — `plan`, `build`,
+`verify`, `review`, `accept`, and so on, depending on the topology. This is
+exactly what the yard's mini-timeline and the agent trail's execution map
+are showing you: one row or node per phase, in order, each one either
+still ahead, currently running, or finished.
 
-- a **name** and **owner** (`planner`, `builder`, `reviewer`, `acceptor`, …
-  — declared per-topology, see [Topologies](/topologies))
-- a **kind** — `agent` (an LLM does the work), `code` (a deterministic
-  function does the work, e.g. running a shell command), or `engineer` (a
-  human decision recorded with no model call at all — used to distinguish
-  *"a person decided this"* from *"a model produced this"* in the trace,
-  which loses exactly the provenance that matters if the two get collapsed)
-- a **prompt** (agent phases) and an **output type** — the Pydantic
-  `Envelope` subclass the phase's result must validate against
-- a **boundary** — which paths this owner may write, enforced by diffing the
-  repo after the phase runs, not by trusting the agent
+Each phase has a job, an owner (who's allowed to do it), and a boundary
+(what it's allowed to touch — see [What You Can Build](/topologies) for how
+that's enforced). Normally the run walks this list top to bottom. It can
+also step **backward**: a phase that finds something fixable in an earlier
+phase's output sends the run back there for a correction, instead of
+failing the whole thing outright. That's the difference between a
+`correction` count and a `gate fail` count on a run's card in the yard —
+one means something was caught and fixed in place; the other means it
+wasn't.
 
-The runner (`Runner.run()`) walks this list top to bottom, normally. It can
-also **branch backward** — a phase whose `repairs` field names an earlier
-phase sends work back there instead of failing outright. See
-[Retries, Repair &amp; Budget](/concepts/retries-and-budget).
+## 2. Every phase reports back in a fixed shape
 
-## 2. Envelopes — the only thing that crosses a phase boundary
+A phase doesn't hand its work to the next one as a conversation transcript
+— it reports a structured result: what changed, what it's claiming as
+evidence, and a plain-language summary. The next phase reads that report,
+never a replay of everything the previous agent said. This is why a
+resumed or corrected run doesn't lose context the way re-explaining
+something to a person from scratch would — the handoff is data, not prose.
 
-An agent has exactly two output channels: reference files it writes into the
-bay, and a JSON **envelope** — its final structured response. Context
-transfers phase to phase *in code*, never in conversation; the next phase
-reads a parsed envelope, never a transcript of what the previous agent said.
+Each phase's report also has to match a fixed set of required fields for
+that kind of phase — a build reports which files changed and a commit
+message; a review reports whether it approved and, if not, exactly what's
+blocking approval; an acceptance reports one verdict per criterion. A
+report missing a required field is rejected before it ever reaches the
+next phase.
 
-Every envelope is a Pydantic model, and that's a specific, deliberate choice
-documented in the project's own README:
+## 3. A claim is checked before anything trusts it
 
-> `ReviewOutput.model_validate(obj)` either returns a real `ReviewOutput` or
-> raises with the exact field paths that failed, and the required-key list
-> shown to the agent is *derived from the model*, so prompt and enforcement
-> cannot drift.
+A phase can *say* it changed three files, or that a command passed. Code
+checks that before it's believed — the files actually exist and aren't
+empty, a command actually exited zero, JSON that was claimed as an
+artifact actually parses. Nothing downstream ever relies on an unverified
+claim. Two checks run on **every** phase, no matter what:
 
-Every envelope shares a base shape (`status`, `summary`, `artifacts`,
-`notes_for_next_agent`) and each phase kind extends it with what it actually
-needs to report:
+- **The write boundary.** The repository is compared before and after the
+  phase, and anything written outside that role's declared boundary is
+  rolled back — automatically, every time. See
+  [What You Can Build](/topologies#why-a-builder-cant-write-everything-and-a-reviewer-cant-write-anything).
+- **The budget.** Cumulative spend on the run is compared against its
+  ceiling. This is the one check that behaves differently from the rest —
+  see [Retries, Repair & Budget](/concepts/retries-and-budget) for what
+  actually happens when a run goes over.
 
-```python
-class BuildOutput(Envelope):
-    changed_files: list[str]
-    commit_message: str
+A topology can add more checks on top of these two — usually "does the
+real test suite pass" plus, for anything riskier, a review skill's
+judgment call.
 
-class ReviewOutput(Envelope):
-    """Confirmation that what was built is what was asked for — not a test run."""
-    approved: bool
-    findings: list[ReviewFinding]
-    blocking: list[str]        # what must change before approval
+## 4. Every run gets its own isolated copy of the repo
 
-class AcceptOutput(Envelope):
-    results: list[CriterionResult]   # one verdict per acceptance criterion, with evidence
-```
+A run works in a **bay** — a real, throwaway copy of the repository, not
+your actual working tree. Nothing a run does — including something that
+gets caught and rolled back — ever touches the repo you started from until
+you explicitly land it. See
+[Reviewing & Landing](/architecture/bays-and-landing) for what "held" versus
+"landed" means and how a held bay gets merged later.
 
-`artifacts` is a **claim**, not a fact — a gate (`artifacts_exist`,
-`files_non_empty`) verifies the claimed paths are actually on disk before
-anything downstream trusts them.
+## 5. Everything that happens is written down, live
 
-## 3. Gates — code checks the agent's output, always
-
-A gate is an async function `(Envelope, BayContext) -> GateReport`. A
-`GateReport` records *every* check it made, passing or failing — deliberately,
-because a gate that returns a bare `True`/`False` can't tell you whether it
-verified three things or zero.
-
-Shipyard ships eight gates (`shipyard/core/gates.py`):
-
-| Gate | Checks |
-|---|---|
-| `artifacts_exist` | every path the agent claimed as an artifact is actually on disk |
-| `files_non_empty` | a claimed artifact that exists but is empty is a claim not honored |
-| `json_parses` | any declared `.json` artifact actually parses |
-| `diff_matches_claims` | every file the agent claimed it changed actually exists |
-| `verdict_consistent` | a review's verdict agrees with the findings it just wrote |
-| `writes_within_boundary` | the boundary described below |
-| `command_succeeds` | a named shell command exits `0` (topology-declared sensors use this) |
-| `budget_not_exceeded` | cumulative run spend hasn't crossed the task's ceiling |
-
-Two of these run on **every agent phase, unconditionally**, regardless of
-what the topology declares:
-
-- **`writes_within_boundary`** — not optional, not topology-configurable.
-  `tools` (what an agent may *attempt*, enforced before the fact by the
-  runtime) and `writes` (what may *survive*, enforced after the fact by
-  diffing the repo) are deliberately two different mechanisms. Withholding a
-  tool can't stop an agent from writing outside its lane — bash can run `git
-  checkout` regardless — so the write boundary is what actually holds, and
-  it's checked by literally diffing the filesystem, never by asking. A
-  violation isn't just reported: **the change is rolled back**, so no later
-  gate is ever measuring work the agent wasn't allowed to do.
-- **`budget_not_exceeded`** — see
-  [Retries, Repair &amp; Budget](/concepts/retries-and-budget) for exactly
-  how this one behaves differently from the rest.
-
-A topology's own `sensors` add more gates on top — code sensors
-(`command_succeeds`, e.g. running the real test suite) and inferential
-sensors (a reviewing skill's judgment call).
-
-## 4. Bays — one isolated worktree per run
-
-Every run gets its own **bay**: a real `git worktree`, not a shared
-checkout. A misbehaving agent's changes are physically isolated to a
-throwaway directory under the system temp dir; nothing it does can touch
-your actual working tree. See
-[Bays, Worktrees &amp; Landing](/architecture/bays-and-landing) for
-provisioning, landing policy, and how a held bay gets merged later.
-
-## 5. The trace — one durable, queryable record
-
-Every phase start/end, every gate check (with a typed `kind`, not just
-prose — a gate failure can be dispatched on *what kind* of thing went wrong
-without string-matching), every correction, every dollar spent, is written
-to SQLite as it happens. The dashboard, `shipyard runs`, and a resumed build
-all read the same tables — there's no separate ingest path, and no
-"generated status claim" standing in for what the trace actually recorded.
-See [Trace &amp; Recovery](/architecture/trace-and-recovery).
+Every phase starting and ending, every check, every correction, every
+dollar spent — all of it lands in a durable, queryable history the moment
+it happens. The yard, `shipyard runs`, and a resumed build are all reading
+that exact same history — there's no separate summary being generated for
+display, and no status you'd see that isn't backed by a real recorded
+event. See [Trace & Recovery](/architecture/trace-and-recovery) for what's
+actually recorded and exactly what a resume does and doesn't re-check.
 
 ---
 
-Next: how a gate failure actually gets corrected instead of restarted, and
-why budget is the one gate that explicitly refuses to play that game — see
-[Retries, Repair &amp; Budget](/concepts/retries-and-budget).
+Next: how a fixable problem actually gets corrected instead of the run
+restarting, and why a budget limit is the one check that refuses to play
+that game — see [Retries, Repair & Budget](/concepts/retries-and-budget).

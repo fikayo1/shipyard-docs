@@ -2,92 +2,109 @@
 title: What a Topology Is
 ---
 
-# Topologies
+# What you can build
 
-A topology (`topologies/<name>/topology.yaml`) is the single source of
-truth for one service shape: its stack, its boundary roles, its protected
-paths, and its sensors. The runner has **no other way** to obtain any of
-these — there are no boundary literals anywhere else in the codebase, so
-the file and the enforcement can never quietly drift apart.
+Shipyard doesn't attempt to build "any software" — every build runs
+against a **topology**: a declared shape of stack, roles, and checks. An
+LLM can, in principle, produce almost anything, which makes "a harness for
+any software" the wrong kind of problem to try to solve directly. Picking a
+topology up front is what makes the guarantees in
+[the introduction](/) — boundaries enforced, checks real, acceptance
+evidence-backed — actually hold, instead of being aspirational.
 
-`shipyard/core/topology.py`'s own module docstring frames why this matters
-more than it might look:
+A topology comes from one of two places, and you don't have to choose which
+— Shipyard picks the right one for what you asked for:
 
-> An LLM can produce almost anything, so a harness for "any software" is not
-> a hard problem — it is an ill-posed one. Committing to a topology is the
-> variety-reduction move that makes a complete harness achievable.
+## Most everyday requests: composed automatically
 
-## Fields on a `Topology`
+Ask for an ordinary web app or API — "a bookmark manager," "a page where
+people can sign in and leave comments" — and there's no topology file to
+pick at all. During intake, Shipyard reads what you actually asked for and
+assembles one on the spot from two ingredients:
 
-```python
-@dataclass(frozen=True, slots=True)
-class Topology:
-    name: str
-    description: str
-    stack: dict[str, str]                 # language, framework, data layer, test runner, ...
-    layers: list[str]                     # the architectural layers a builder should respect
-    boundaries: dict[str, Boundary]       # owner -> {writes, tools}
-    protected: list[str]                  # paths no agent may ever touch
-    sensors_in_loop: list[Sensor]         # pre-land checks (usually code: run the real tests)
-    sensors_post_integration: list[Sensor]  # post-merge checks (often inferential: a review skill)
-    safe_change_classes: list[str]        # change classes eligible for auto-land at LAND_SAFE
-    models: dict[str, str]                # optional per-owner model routing
-    operator_secrets: list[OperatorSecret]  # env vars the DELIVERED PRODUCT needs (not the build)
-    scaffold: Path | None                 # stamped-by-code starter files for a greenfield build
-```
+- **A policy** — a base scaffold for the shape you're building: a plain
+  static site, a Python/FastAPI service, a Next.js app, or Next.js with a
+  separate FastAPI backend.
+- **Capabilities** — small, composable pieces bolted onto that base only
+  when your request actually needs them. Mention persistent data and it
+  adds Postgres; mention accounts or sign-in and it adds server-side auth.
+  Each capability brings its own **operator inputs** along with it — ask
+  for accounts and a database, and you'll be asked for `AUTH_SECRET` and
+  `DATABASE_URL` specifically because you asked for those things, not as a
+  generic checklist.
 
-## Fail loudly, never default
+Two guardrails come with this, both aimed at the same failure mode — an
+agent quietly faking a requirement it wasn't given real infrastructure for:
 
-Three rules, stated in the loader's own docstring, each existing because the
-quiet alternative is a security hole:
+- **A static site can't secretly gain a login and a shared database.**
+  If your request implies both real identity/authorization *and* durable
+  data shared across users, Shipyard won't let it be scaffolded as a static
+  site — that combination needs a real server, and a static site has none.
+  It asks you instead of silently reaching for something like browser
+  storage to fake the difference.
+- **You choose the deployment shape, not the model.** If your request
+  needs accounts or a database and you're building in Next.js, intake asks
+  you directly: one full-stack Next.js deployment, or separate Next.js
+  frontend and FastAPI backend? A decision with real infrastructure
+  consequences doesn't get made silently on your behalf.
 
-- **An unknown topology name is an error**, never a silent fallback to a
-  default shape.
-- **An owner with no declared boundary is an error.** Defaulting to `[]`
-  would silently make that owner read-only and every phase using it would
-  fail for a reason nobody could see; defaulting to `["**"]` would silently
-  grant write access to everything. There is no safe guess, so there's no
-  guess.
-- **An empty `protected` list is an error.** That list is what stops an
-  agent editing the machinery that grades it — an absent-mindedly empty one
-  looks exactly like a deliberate one, so it isn't allowed to happen
-  quietly.
+This is what backs the **project kind** field you'll see in `shipyard new`
+and the yard's new-work form (static site, Next.js, Next.js + FastAPI,
+Python API) — see [Getting Started](/getting-started) and
+[The Yard](/dashboard) for where you'll actually encounter it.
 
-## `writes` vs. `tools` — two different mechanisms, on purpose
+## A few product shapes: hand-authored topologies
 
-```python
-@dataclass(frozen=True, slots=True)
-class Boundary:
-    writes: list[str]
-    tools: list[str] | None = None
-```
-
-`writes` is enforced **after the fact**, by diffing the repository — it's
-what may *survive*. `tools` is enforced **before the fact**, by the
-runtime — it's what may be *attempted*. Neither substitutes for the other:
-withholding a tool can't stop an agent changing files (bash can run `git
-checkout` regardless of what tools were offered), which is why `writes`
-exists at all. But a boundary alone would let a read-only reviewer spend a
-turn writing code that then gets reverted — learning nothing, and billing
-you for the attempt — so a reviewer role should never be handed `Write` in
-the first place.
-
-## The three topologies today
+Some products are enough of their own thing — a distinct set of roles, or
+a step that should never be a model's call to make — that they get a real
+`topology.yaml` file instead of being composed at request time:
 
 | | `api-service` | `python-api` | `release-manager` |
 |---|---|---|---|
 | Stack | TypeScript, Fastify, Prisma, Postgres, vitest | Python, FastAPI, SQLite, pytest, uvicorn | Python, FastAPI, SQLite, pytest, uvicorn |
-| Scaffold | — | `./scaffold` | `./scaffold` |
-| Boundary roles | planner, bootstrap, builder, reviewer, acceptor | same | same, **plus** `scanner` (read-only) and `drafter` (writes only `release/`) |
-| Notable difference | — | — | `publish`/`rollback` are deliberately **code phases**, not agent-owned — a model never makes the actual publish decision |
+| Starts from a scaffold | — | yes | yes |
+| Roles | planner, bootstrap, builder, reviewer, acceptor | same | same, **plus** a read-only scanner and a drafter restricted to a `release/` folder |
+| What's different | — | — | publishing and rollback are handled by plain code, never by model judgment — because that step holds a live credential |
 
-`api-service` and `python-api` are close to a pure stack swap — same
-boundary roles, same two-tier gate structure (pre-land code checks,
-post-integration inferential review), same autonomy machinery, entirely
-different stack. `release-manager` is the outlier: it adds boundary roles
-neither other topology has, and a phase pairing that's deliberately *not*
-agent-owned when it normally would be, because the builder is writing code
-that will hold a live GitHub credential. See
-[Does Every Product Need One?](/topologies/scaling) for when a new product
-actually earns a new topology, versus when it should just use `python-api`
-unmodified.
+`api-service` and `python-api` are close to a pure stack swap — same roles,
+same two-tier review structure, entirely different language and
+framework. `release-manager` is the real outlier: extra roles the others
+don't have, and a deliberate decision to keep a human — or code, never a
+model — making the one decision that touches a real, live credential.
+
+Run `shipyard topologies` any time to see the current, definitive list of
+these — name, description, stack, and roles — for whatever's installed on
+your machine. (It won't show the composed web-service shapes above; those
+don't exist as files until you actually ask for one.)
+
+## Why a builder can't write everything and a reviewer can't write anything
+
+Every role — in either kind of topology — gets two separate permissions,
+enforced two different ways:
+
+- **What it may write** — checked *after the fact*, by comparing the
+  repository before and after. An attempt to touch a file outside this list
+  gets caught and undone automatically, every time, regardless of how it
+  happened.
+- **What tools it may use** — checked *before the fact*, by the runtime
+  itself.
+
+Both exist because neither alone is enough. Withholding a tool can't fully
+stop an agent from writing somewhere it shouldn't — a shell command can
+touch files a tool restriction never anticipated — so the after-the-fact
+write check is what actually holds. But a write check alone would let a
+role that's supposed to be read-only (a reviewer, say) spend an entire turn
+producing code that just gets thrown away, burning time and budget for
+nothing — so a reviewer is never handed write tools in the first place.
+That's why, for example, a reviewer in every topology above can *run* your
+test suite to form its own opinion, but can't *edit* anything while doing
+it.
+
+## Do you need a hand-authored one?
+
+Almost certainly not, even for a genuinely new product — the composed path
+above covers most everyday web apps and APIs on its own. See
+[Does Every Product Need One?](/topologies/scaling) for exactly when a new
+`topology.yaml` is warranted versus when composition (or an existing file)
+already fits, and [Writing a New Topology](/topologies/writing-a-topology)
+for how to build one when it's actually earned.

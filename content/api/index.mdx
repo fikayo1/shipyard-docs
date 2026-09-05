@@ -4,24 +4,21 @@ title: HTTP API Reference
 
 # HTTP API reference
 
-Everything `shipyard` can do from a terminal, another agent, another
-service, or the dashboard's own UI can now reach over HTTP —
-`shipyard/dashboard/server.py`, started with `shipyard yard`
-(`http://localhost:4800` by default, `PORT` to change it). This page is the
-complete, current endpoint list. See [Dashboard](/dashboard) for how the
-same file also serves the yard view's UI and the mechanics behind
-resume/rerun/land; this page is the "call it from code" reference.
+Everything the CLI and the yard dashboard can do is reachable over
+plain HTTP too — start it with `shipyard yard`
+(`http://localhost:4800` by default, `PORT` to change it). Use this API to
+kick off or watch a build from a script, from CI, or from another agent,
+instead of a terminal or a browser. This page is the complete, current
+endpoint list; see [The Yard](/dashboard) for the same actions as browser
+screens.
 
 ## The one rule everything here follows
 
-**Every endpoint is a second front door onto a command that already exists
-at a terminal — never a second implementation of it.** A write endpoint
-either spawns the exact CLI subcommand a person would type
-(`python -m shipyard.cli.__main__ <verb> ...`), or calls the exact library
-function that CLI subcommand calls. That means the guards a terminal user
-gets — refusing to land a run that never finished, refusing a second
-resume while one is already running — are the guards a caller over HTTP
-gets too, because it is the literal same code path.
+**Every endpoint does exactly what the matching CLI command does — never
+less, never something subtly different.** That means the same guards apply
+either way: a caller over HTTP can't land a run that never finished or
+trigger a second resume while one's already in flight, any more than a
+terminal user could.
 
 ## Two guards, off by default
 
@@ -71,6 +68,14 @@ curl -s localhost:4800/api/run/<run_id> | jq '.run.status'
 | `POST /api/builds` | `shipyard build` | Body: either `intake` (a `shipyard new`/`iterate` output directory) or `spec` (a `spec.md` path, usually with `criteria`) — one of the two is required. Plus optional `topology`, `repo`, `budget`, `tier`, `provider`, `model`, `verify`, `projects`. |
 
 All three answer `202 {job_id, kind, status: "running", log}` immediately.
+
+<Callout type="warning">
+  **Visual reference attachments (`--image` / `--image-description` on the
+  CLI's `new` and `iterate`) have no HTTP equivalent yet.** `/api/intake`
+  and `/api/iterate` forward every other flag the CLI accepts, but not
+  images — there's no body field for them today. Reach for the terminal
+  command directly if a request needs a design reference attached.
+</Callout>
 
 <Callout type="warning">
   `iterate`, unlike `new`, does not know your intent to extend a specific

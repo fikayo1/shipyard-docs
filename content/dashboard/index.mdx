@@ -2,115 +2,131 @@
 title: The Yard View
 ---
 
-# The dashboard (yard view)
+# The yard — Shipyard's dashboard
 
-`shipyard/dashboard/server.py` — `ThreadingHTTPServer` from the standard
-library, one page (`page.html`, re-read from disk on every request so
-editing the UI is a browser refresh, not a restart), and a growing set of
-endpoints. Start it with `shipyard yard` — `http://localhost:4800` by
-default (`PORT` env var to change it). This page covers the yard view's own
-mechanics and internals; see [HTTP API Reference](/api) for the complete,
-current endpoint list — this same file now fronts nearly everything the CLI
-can do, not just resume/rerun/land.
+Start it with `shipyard yard` and open `http://localhost:4800`. It's a
+second front door onto the same commands the CLI has — starting new work,
+watching a run, resuming or landing it — from a browser instead of a
+terminal. Nothing here is a separate implementation: every action the yard
+takes is the exact same code path a terminal command would trigger, so the
+same guardrails apply either way. The [HTTP API Reference](/api) documents
+every endpoint if you want to script against the same actions directly.
 
-## The whole read transport is one query
+The yard has three tabs — **new work**, **yard**, and **agent trail** —
+plus a run's own detail page, one click deeper than the yard tab.
 
-Live view and full history are the same `select * from events where rowid >
-? order by rowid limit N` at different polling cadence — no websocket, no
-separate ingest endpoint, no separate replay path. A reader that's been away
-an hour and a reader polling every 600ms run identical code, just with
-different cursors.
+## New work — shape a request before it spends anything
 
-**The primary object is the run and its phases, not the agent.** A
-dashboard whose rows are agents is a terminal multiplexer with better
-styling — you can see activity, but you can't ask which step failed. The
-agent is an attribute of a phase, never a row of its own.
+<figure>
+  <img src="/images/yard-new-work.png" alt="The new-work screen: drafts on the left, and a numbered form on the right — starting point, request, project decisions, operating envelope." />
+  <figcaption>Nothing here spends money yet — you're editing a draft.</figcaption>
+</figure>
 
-## It also writes, now — starting work, resuming/rerunning/landing/stopping a run, and more
+This is where a request starts. It walks through the same decisions
+`shipyard new`/`shipyard iterate` ask for at a terminal, as a form instead
+of an interview:
 
-What began as three actions (resume, rerun, land) has grown into a real
-second front door onto nearly the whole CLI — starting brand-new work
-(`/api/intake`, `/api/builds`, `/api/iterate`), provisioning
-(`/api/setup/browser-tests`), governed extension proposals
-(`/api/extensions/*`), and per-run support chat and deployment approval.
-The full table lives on the [HTTP API Reference](/api) page rather than
-duplicated here; the point that matters for this page is unchanged:
+1. **Starting point** — a brand-new product, or an existing repository to
+   extend. Pick "existing repository" and give it a path, and the form
+   shows you up front whether Shipyard found a **verified handoff** from an
+   earlier accepted run against that repo (meaning it can skip
+   rediscovering context) or will do bounded discovery from scratch — see
+   [`shipyard iterate`](/cli) for what that handoff actually contains.
+2. **Request** — what should change, in your own words, plus any local
+   reference files (a mock, a screenshot) to attach.
+3. **Project decisions** — topology, project kind, provider, and model.
+   Leave topology blank to let intake recommend one from what you're
+   asking for.
+4. **Operating envelope** — budget, timeout, and autonomy tier, set before
+   any model call happens rather than discovered as a surprise later.
+   Advanced options (a custom verify command, concurrent bay capacity, and
+   so on) are tucked under their own disclosure so the common case stays
+   short.
 
-| Endpoint | Effect |
-|---|---|
-| `POST /api/run/<id>/resume` | spawns `shipyard build --resume <id>` as a subprocess |
-| `POST /api/run/<id>/rerun` | spawns `shipyard rerun <id>` as a subprocess |
-| `POST /api/run/<id>/stop` | signals whichever process owns this run, dashboard- or terminal-spawned |
-| `POST /api/run/<id>/land` | calls `BayManager.land_now()` directly — the same function `shipyard land` calls |
-| `GET /api/run/<id>/log` | tails a spawned resume/rerun's stdout+stderr |
+Saving a draft here doesn't cost anything. **Starting the interview** does
+— it hands your request to the model, which asks follow-up questions where
+it's genuinely ambiguous (including, for an authenticated or persistent
+Next.js app, an explicit question about which deployment shape you want —
+see [What You Can Build](/topologies#most-everyday-requests-composed-automatically)),
+then produces a reviewable specification and acceptance-criteria list. Not
+happy with it? **"return to intake"** sends you back to revise the request
+instead of accepting a draft you'd rather change — each pass is kept as a
+version, and once you've revised at least once you can see exactly what
+changed between versions before approving.
 
-None of this is new capability — every endpoint spawns the exact CLI
-subcommand a terminal would run, or calls the exact library function that
-subcommand calls. This is a second front door, not a second implementation:
-**the guards a terminal user gets are the guards a browser (or any other
-HTTP caller) gets too**, because it's the literal same code path.
+You approve an exact version before a build ever starts; nothing builds off
+a spec you haven't seen. Whatever the compiled project actually needs —
+`DATABASE_URL` because you asked for persistent data, `AUTH_SECRET` because
+you asked for accounts, or a topology's own fixed list — is asked for right
+there and goes straight into the build's process environment, never saved
+into the draft, the trace, or a URL. If something required is missing,
+`shipyard build` refuses to start at all — no bay, no agent, no spend —
+and tells you by name what's still needed.
 
-### Resume and rerun spawn the real CLI
+## Yard — every run you've started
 
-```python
-CLI = [sys.executable, "-m", "shipyard.cli.__main__"]
+<figure>
+  <img src="/images/yard-run-grid.png" alt="The yard tab: a grid of run cards, each showing topology, a phase timeline, a status badge, cost, duration, and gate-fail or correction counts." />
+  <figcaption>61 runs, newest first — click any card for its full detail.</figcaption>
+</figure>
 
-proc = subprocess.Popen(
-    [*CLI, *argv],
-    cwd=str(Path.cwd()),
-    env=os.environ.copy(),
-    stdout=log_file,
-    stderr=subprocess.STDOUT,
-    start_new_session=True,
-)
-```
+Each card is one run, and everything on it is meant to be readable at a
+glance without opening anything:
 
-Two things worth knowing if a dashboard-triggered run behaves unexpectedly:
+- **The mini-timeline** — one row per phase owner (planner, builder,
+  reviewer, acceptor, …), with a bar for how long each phase actually ran.
+  A gap means that phase hasn't started yet; a bar still growing means it's
+  running now.
+- **The status badge** — `done` (finished clean), `held` (finished, but
+  waiting on you to land it), `interrupted` (stopped before finishing —
+  resumable), or a `⏸ budget paused` badge specifically for a run that hit
+  its spending limit mid-phase (see below).
+- **Cost, duration, gate-fail count, correction count** — a run with
+  corrections isn't necessarily unhealthy; it means the harness caught
+  something and fixed it in place rather than restarting. A `gate fail`
+  badge with no corrections after it is the one worth opening first.
+- **`resume` / `restart`** — right on the card, no need to open it first.
+  `resume` re-enters an interrupted or budget-paused run where it left off;
+  `restart` runs the same request again from a clean copy of the repo. See [the CLI reference](/cli) for the difference between `resume` and
+  `rerun` in what each one actually reuses.
 
-- **`env=os.environ.copy()`** — the child inherits exactly the dashboard
-  process's own environment, nothing more. If the dashboard was started in
-  a terminal that never had (say) `SHIPYARD_OPENAI_BASE_URL` exported,
-  every resume/rerun it spawns fails on startup, even if builds run
-  directly from another terminal work fine. See
-  [Operator Secrets](/getting-started/operator-secrets) for the real
-  incident this caused and how to spot it (`started: true` in the API
-  response, but nothing ever shows up as running — check the log).
-- **A double-click is guarded**, not just debounced client-side: a
-  class-level `_active` dict, locked, refuses a second resume/rerun for the
-  same run while one is already in flight (`proc.poll() is None`), and
-  returns `409` rather than silently launching two.
+### Opening a run
 
-### Land calls the exact function `shipyard land` calls
+Click a card for its full detail: every phase with its gates and any
+corrections, the running cost, and the same `resume`/`restart`/`land`/`stop`
+actions as buttons instead of CLI flags. Two things live only here:
 
-```python
-result = await bays.land_now(repo, bay_row["branch"])
-self.trace.bay_status(bay_row["bay_id"], "done", ended=True)
-```
+- **A budget-paused run offers "increase budget & resume", not just
+  "resume."** Clicking it shows you exactly what will be reused before you
+  submit — a saved checkpoint (which phase, which attempt) if one exists
+  and is still valid against the bay's current state, or a plain statement
+  that none does and the phase will restart clean. You're never resuming
+  blind.
+- **Session support** — a small chat scoped to this one run, grounded only
+  in its own recorded evidence (recent events, phase status, cost). Ask it
+  what a failure meant or whether it's ready to deploy. It can propose an
+  action, like a deployment plan, but never take one on its own — the
+  dashboard doesn't currently expose a button to approve a proposed action
+  from the browser, so that last step (and planning a Vercel deployment in
+  the first place) has to go through [the HTTP API](/api#per-run-support-chat-and-deployment-approval)
+  directly for now.
 
-Same refusal conditions as the CLI command (not `--repo`, not `done`, not
-`held`), and the same fix for the same gap: without the `bay_status(...,
-"done", ...)` call after a successful merge, a landed bay stayed marked
-`held` forever and the dashboard kept offering to land something already
-landed.
+A run that failed acceptance shows exactly which criteria didn't pass and
+the evidence for each, not just a pass/fail summary — so you know precisely
+what's still wrong without digging through raw trace events.
 
-## Reconciliation on every poll
+## Agent trail — what a bay actually looks like right now
 
-`/api/yard` and `/api/run/<id>` both call
-`self.trace.reconcile_orphans(stale_after_s=RECONCILE_STALE_S)` before
-answering — `RECONCILE_STALE_S = 1800.0`. See
-[Trace &amp; Recovery](/architecture/trace-and-recovery#orphan-reconciliation)
-for why the dashboard specifically needs the staleness-aware version rather
-than the CLI's unconditional one: a build genuinely in progress can sit
-with zero new events for the length of one model call, and a shorter
-threshold would misdiagnose that as stuck.
+The third tab is a live map of one run's in-progress workspace: which
+phase is running, which files it's changed so far, and the actual diff for
+any of them — the closest thing to looking over the agent's shoulder
+without reading a raw event log. Useful mid-build, when you want to see
+what's being written before the run even reaches review.
 
-## `runs.status` and `bays.status` can diverge — the UI has to track both
+## If a browser action seems to do nothing
 
-A run whose acceptance criteria fail flips `runs.status` to `failed` but
-never touches `bays.status`. The frontend's own change-detection
-(`signature()`) has to fingerprint both fields independently for exactly
-this reason — fingerprinting only one meant a run whose acceptance just
-failed could sit on screen with stale action buttons until some unrelated
-field happened to change. See
-[Trace &amp; Recovery](/architecture/trace-and-recovery#schema) for the
-full schema.
+`shipyard yard` is its own long-running process, separate from whatever
+terminal you use for anything else. A Resume or Restart it spawns only has
+access to environment variables that were set *before that process
+started* — see [Operator Secrets](/getting-started/operator-secrets) for
+the exact failure this causes and how to spot it from a run's log.

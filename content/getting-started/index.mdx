@@ -5,7 +5,7 @@ title: Installation
 # Installation
 
 Requires **Python 3.11+**. No database server, no Docker, no external
-services to stand up first — SQLite and `asyncio` are both standard library.
+service to stand up first.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -14,10 +14,9 @@ pip install -e ".[dev]"
 
 <Callout type="warning">
   On some Python builds, an editable install's `.pth` entry is silently
-  skipped by `site.py` — `pip` reports success, but `import shipyard` fails
-  with no explanation. `PYTHONPATH` is read by the interpreter *before*
-  `site.py` runs, so it can't be skipped the same way, and it keeps edits
-  live without reinstalling:
+  skipped, and `import shipyard` fails with no explanation even though
+  `pip` reported success. If that happens, this makes edits (and the
+  install) work reliably:
 
 ```bash
 echo "export PYTHONPATH=\"$PWD:\$PYTHONPATH\"" >> .venv/bin/activate
@@ -25,49 +24,43 @@ deactivate && source .venv/bin/activate
 ```
 </Callout>
 
-## Verify the install
+## Check it worked
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-This should pass with no network access and no API key required — every test
-either exercises pure logic, spins up a real (throwaway) git repo or HTTP
-server, or drives a **scripted adapter** that replays a fixed script instead
-of calling a model. See [Testing Philosophy](/testing) for why that
-distinction matters.
+This passes with no network access and no API key — nothing here talks to a
+real model yet.
 
-## What's needed for what
+## What each way of using Shipyard actually needs
 
-Not every Shipyard command needs the same things:
+Not everything needs a model or a credential. Use this to know what you can
+try right now versus what needs setup first:
 
-| Command | Needs |
+| To do this | You need |
 |---|---|
-| `shipyard demo` | Nothing — scripted adapter, no API key, no cost |
-| `shipyard yard` | Nothing — reads the local trace database |
-| `shipyard runs` / `rerun` / `land` | Nothing beyond the trace database |
-| `shipyard new` | Claude Code on `PATH`, authenticated |
-| `shipyard build` | Claude Code on `PATH`, authenticated, plus whatever the target topology's operator secrets declare (see [Operator Secrets](/getting-started/operator-secrets)) |
+| Watch the yard dashboard, browse past runs | Nothing — reads the local run history |
+| Run the free scripted demo | Nothing — no API key, no cost |
+| Start a real new product (`shipyard new` / `POST /api/intake`) | Claude Code installed and authenticated (`claude` on `PATH`), or an OpenAI-compatible provider key |
+| Build it (`shipyard build` / `POST /api/builds`) | Same as above, plus whatever the target topology's *own* product needs at runtime (see [Operator Secrets](/getting-started/operator-secrets)) |
 
-Run `shipyard` with no arguments any time to see the current command list —
-it's the single source of truth for what's available, kept current by the
-CLI itself rather than by hand-copying command names into a doc that drifts.
+Run `shipyard` with no arguments any time to see the current, complete
+command list straight from the tool itself.
 
-## Layout
+## Repository layout
+
+Only relevant if you're going to read or extend Shipyard's own source, not
+for using it day to day:
 
 ```
 shipyard-py/
-├── shipyard/
-│   ├── core/         # types, contracts, gates, runner, trace, adapter, topology loader
-│   ├── fleet/         # bay (worktree provisioning + landing), yard scheduler
-│   ├── adapters/       # claude_code, openai_compatible, routing
-│   ├── cli/           # the shipyard command dispatcher and its subcommands
-│   └── dashboard/      # the yard view server + page
-├── topologies/          # service shapes — loaded as config, not decorative
-├── specs/               # per-product spec.md + criteria.json (one per product)
-├── tests/                # pytest — see Testing Philosophy
-└── examples/              # demo.py, the scripted no-cost walkthrough
+├── shipyard/        # the library: runner, gates, trace, adapters, CLI, dashboard
+├── topologies/       # the product shapes Shipyard can build — see What You Can Build
+├── specs/             # one spec.md + criteria.json per product you've started
+├── tests/              # the test suite
+└── examples/            # the free scripted demo
 ```
 
-Next: run [the quickstart](/getting-started/quickstart) — demo first (free),
-then a real `new` → `build` run.
+Next: [the quickstart](/getting-started/quickstart) — a free run first, then
+a real one.

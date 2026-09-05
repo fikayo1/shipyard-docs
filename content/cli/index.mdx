@@ -4,12 +4,10 @@ title: Command Reference
 
 # CLI reference
 
-One dispatcher, `shipyard`, with one subcommand per verb
-(`shipyard/cli/__main__.py`). Every subcommand's real logic lives in its own
-module and can be run directly too (`python -m shipyard.cli.build`), which is
-what the tests do. Most of what's below is also reachable over HTTP without
-a terminal at all — see [HTTP API Reference](/api) for the endpoint that
-fronts each verb.
+One command, `shipyard`, with one subcommand per thing you're trying to do.
+Most of what's below is also reachable over HTTP without a terminal at all —
+see [HTTP API Reference](/api) for the endpoint that fronts each verb, and
+[The Yard](/dashboard) for the same actions as browser screens.
 
 ```
 shipyard — a fleet-aware software factory
@@ -43,6 +41,19 @@ source of truth for the current flag set, kept current by the CLI itself.
 Interviews you and writes `spec.md` + `criteria.json`. Needs Claude Code on
 `PATH`, authenticated. This is intake — see
 [Core Concepts](/concepts) for what the two output files actually are.
+Accepts repeatable `--image PATH` / `--image-description TEXT` flags to
+attach visual references (a mock, a screenshot, a competitor page) to the
+intake — see [visual reference attachments](#visual-reference-attachments)
+under `iterate`, which documents the same flags.
+
+For an ordinary web app or API (no `--topology` given), the interview also
+picks a **project kind** and composes a topology from it on the spot — see
+[What You Can Build](/topologies#most-everyday-requests-composed-automatically).
+Two things it'll stop and ask you about directly, rather than deciding on
+its own: a request that implies both real user accounts and shared,
+durable data can't be scaffolded as a plain static site, and a Next.js app
+that needs either of those gets asked whether you want one full-stack
+deployment or a separate FastAPI backend.
 
 ## `shipyard iterate <repo> "<intent>"`
 
@@ -56,11 +67,51 @@ shipyard iterate /path/to/existing-repo "add rate limiting to the public API"
 Before running the same intake flow `new` uses, it builds a bounded
 "product context" dossier from the target repo: landmark files (README,
 `package.json`, `pyproject.toml`, and similar), each sha256'd and truncated
-to 12KB, a top-level file inventory, the current git HEAD, and whether the
-working tree is dirty. That context is folded into the generated
-`spec.md`'s own "Context" section, so the interview and the resulting
-criteria are grounded in what's actually there instead of assuming a blank
-slate.
+to 12KB, a top-level file inventory, the current git HEAD, whether the
+working tree is dirty, and a bounded **repository map** — up to 800 files,
+never a source dump, summarized down to the language breakdown, the roots
+that exist (`frontend/`, `backend/`, `src/`, and similar), and a truncation
+flag so a large monorepo degrades to "here's the shape" instead of failing
+or silently reading half the tree. That context is folded into the
+generated `spec.md`'s own "Context" section, so the interview and the
+resulting criteria are grounded in what's actually there instead of
+assuming a blank slate.
+
+### Reusing a verified handoff instead of rediscovering context
+
+If an earlier `build` against this exact repository was **accepted**, its
+run wrote a `handoff.json` (`shipyard/core/handoff.py`) — a compact,
+secret-safe record of what that run did: the request, the topology, the
+verification command, which landmark files existed, and (see below) any
+visual references attached to it. The next `iterate` against the same repo
+looks for one automatically (`compatible_handoff()` in
+`shipyard/cli/iterate.py`) and, if it finds one, starts the intake from that
+handoff instead of rediscovering context from scratch:
+
+- **Same commit** wins outright — the newest exact-match handoff is used as-is.
+- **An ancestor commit** is still usable, but only if nothing changed since
+  it that could invalidate the handoff's own assumptions — a change to
+  `package.json`, `pyproject.toml`, a lockfile, or similar is treated as
+  high-risk and disqualifies that handoff, falling back to fresh discovery.
+- A **dirty working tree** always skips handoff reuse — an uncommitted,
+  unreviewed change is exactly the situation a stale handoff could get
+  wrong silently.
+
+Pass `--refresh-context` to skip this and force fresh discovery regardless
+— useful if you suspect the repo has drifted in a way the ancestor check
+wouldn't catch, or you just want a clean-slate read. The dossier printed at
+the top of an `iterate` run's output says which path it took: `(handoff
+specs/.../handoff.json)` or `(bounded discovery)`.
+
+### Visual reference attachments
+
+`--image PATH` (repeatable) with a matching `--image-description TEXT`
+attaches design references — a screenshot, a mock, a competitor page — to
+the intake. They're carried through into the run's own handoff as
+lightweight metadata (filename and description, not the image bytes
+themselves), so a *later* `iterate` against this repo knows design evidence
+exists for the prior increment without the file needing to be re-attached
+or re-uploaded.
 
 <Callout type="warning">
   `iterate` builds the dossier and writes `spec.md` + `criteria.json` — it
@@ -79,6 +130,16 @@ The main event — scaffold (if greenfield), plan, build, verify, review,
 accept, land. See [Quickstart](/getting-started/quickstart) for a worked
 example and the flags that matter most (`--verify`, `--repo`, `--budget`,
 `--tier`).
+
+<Callout type="warning">
+  If `shipyard new` compiled a project that needs operator input — say,
+  `DATABASE_URL` because you asked for persistent data — and you haven't
+  exported it yet, `build` refuses to start at all: no bay, no agent
+  call, no spend. It prints exactly which values are still missing and
+  stops with a non-zero exit code. Export them and rerun the same command;
+  values are never accepted as a build flag, only as a real environment
+  variable, so nothing sensitive ends up in a spec or the trace.
+</Callout>
 
 ### `--resume <run-id>`
 
@@ -107,6 +168,18 @@ for "it got interrupted, try again" (a network glitch, a missing credential
 that's now available); it is not the right tool for "the software doesn't
 do what was asked yet" — that needs a phase that can actually write code,
 which only `rerun` or a fresh `build` provide.
+
+<Callout type="info">
+  A run that was paused for running over budget (`status = 'paused_budget'`,
+  see [Retries, Repair &amp; Budget](/concepts/retries-and-budget)) is also
+  resumable. Pass a higher `--budget` explicitly on the resume command —
+  resume restores every other recorded input automatically, but budget is
+  the one flag you're expected to actually change. If a validated
+  checkpoint exists for the paused phase, resume continues from it rather
+  than re-paying for work already done; see
+  [Checkpointed resume](/architecture/trace-and-recovery#checkpointed-resume)
+  for exactly what gets reused and when it's refused instead.
+</Callout>
 
 ### `--claude-timeout <seconds>`
 
@@ -166,12 +239,10 @@ to `done`** — without this, a landed bay stays marked "held" forever and the
 yard view keeps offering to land something already landed (a real gap found
 and fixed while building this feature).
 
-The guard logic here is deliberately this command's job, not the underlying
-`BayManager.land_now()`'s — `land_now` does the merge and nothing else, no
-autonomy check, no status check, because by the time a human runs this
-command, the human's judgment already *is* the check. The exact same
-function backs the dashboard's Land button (`POST /api/run/<id>/land`) —
-see [Dashboard](/dashboard).
+Those checks are deliberately this command's job, not something the merge
+itself enforces — by the time you run `land`, your judgment already is the
+check. The dashboard's Land button does the exact same thing, with the same
+refusals — see [The Yard](/dashboard).
 
 ## `shipyard demo`
 

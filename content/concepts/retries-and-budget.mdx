@@ -4,110 +4,91 @@ title: Retries, Repair & Budget
 
 # Retries, repair & budget
 
-Shipyard has three distinct backstops against a run going wrong, and they
-behave differently on purpose. Confusing them is exactly what caused a real
-bug, described below.
+Three different backstops kick in when something goes wrong mid-run, and
+they behave differently on purpose — confusing them is exactly what caused
+a real bug, described below.
 
 ## Within a phase: correction, not restart
 
-When a gate fails on an agent phase, the runner doesn't throw the attempt
-away and start over — it sends a **correction** into the *same live
-session*, naming exactly what was wrong:
+When a check fails on a phase, the run doesn't throw the attempt away and
+start over — it sends a **correction** back into the *same* agent session,
+naming exactly what was wrong, and the agent tries again with full memory
+of what it already knows about the codebase. This is what a `correction`
+count on a run's card in the yard means, and it's bounded — a handful of
+attempts, not an unlimited loop, because a correction cycle with no ceiling
+is just a slower way to discover the agent can't fix this one.
 
-```
-attempt 1 → gate fails → session.correct(violations) → attempt 2 → ...
-```
+If the problem was writing somewhere it shouldn't have, that out-of-bounds
+change is undone *before* the correction is sent — the next attempt starts
+clean, not on top of work it was never allowed to do.
 
-The agent keeps its context (what it already tried, what it already knows
-about the codebase) and just gets told what to fix. This is bounded by
-`retries` (default 2, so up to 3 attempts total) — a correction loop with no
-ceiling is just a slower way to exhaust a budget discovering that the agent
-can't fix this one.
+## Across phases: sending work back further
 
-If a **boundary** violation caused the failure, the out-of-bounds change is
-rolled back before the correction is sent — so the next attempt starts from
-a clean, in-bounds state, not from work it was never allowed to do.
+Sometimes the fix belongs further back than the phase that noticed the
+problem. Two situations trigger this:
 
-## Across phases: the repair loop
+- **A real check fails** — your actual test suite, for instance — and its
+  output is fed back to whichever phase can act on it, so the next attempt
+  is responding to what genuinely broke, not a vague "try again."
+- **A phase finishes cleanly but the work genuinely isn't done yet** — a
+  distinct case from a failed check: nothing the phase produced was wrong,
+  it just isn't finished (an honest acceptance ruling that some criteria
+  still fail, for example). This also routes back for another pass rather
+  than failing the run outright.
 
-A phase can also be configured with a `repairs` target — the name of an
-earlier phase to send work back to. Two triggers:
-
-- **A code phase fails** (e.g. the real test suite the topology's
-  `command_succeeds` sensor runs) and names a `repairs` target — the
-  failure's actual output goes back to the builder as the "previous"
-  envelope, so the next attempt is informed by what genuinely broke, not by
-  a vague "try again."
-- **An agent phase succeeds but a `repair_if` predicate says the work isn't
-  actually done** — this is a real, separate case from a gate failure:
-  *nothing about the agent's output was wrong*, it just isn't finished
-  (e.g. an acceptor that ruled honestly and found real failing criteria).
-  This routes back to a repair target rather than failing the run outright.
-
-Bounded by `DEFAULT_REPAIRS = 2` attempts, with one more real safeguard: **a
-repair that produces the identical failure has stopped repairing anything.**
-This happened for real, and the runner's own comment documents it:
-
-> A Python project was verified with `npx tsc`, which the builder cannot fix
-> — the command is not its to change and the toolchain is not there. Two
-> rounds of an agent rewriting correct code against an impossible check cost
-> real money and produced nothing.
-
-So the runner compares each repair attempt's failure text against the
-previous one; an identical failure stops the loop immediately rather than
-spending a second (or third) attempt on something structurally unfixable.
+This is also bounded, with one extra safeguard: if a repair attempt comes
+back with the *identical* failure as the one before it, the run stops
+immediately instead of trying again. This came from a real incident — a
+Python project's check was something the builder had no way to change, and
+two rounds of an agent rewriting already-correct code against an
+unfixable check cost real money for nothing. Comparing each attempt's
+failure to the last one closed that.
 
 ## Across the whole run: budget is a hard stop, not a retry
 
-This is the one that looks like the other two but isn't, and treating it
-like the other two is a real bug that shipped, was caught in production use,
-and was fixed.
+This is the one that looks like the other two but isn't — and treating it
+like the other two shipped as a real bug before it was caught and fixed.
 
-`budget_not_exceeded` is a gate — mechanically, it sits in the same list as
-every other gate a phase checks. But unlike a boundary violation or a
-missing-evidence problem, **there is nothing an agent's reply can do to fix
-being over budget.** Money already spent can't be un-spent by a correction.
-
-Originally, budget was gated exactly like everything else: it failed →
-went into `violations` → triggered `session.correct(violations)` →
-another (paid) attempt → which, obviously, doesn't reduce spend. If the run
-was still over budget on the next attempt (it always was — spending more
-money doesn't lower a budget total), the cycle repeated up to the retry
-ceiling.
+Going over budget looks, mechanically, like any other failed check. But
+unlike a boundary violation or something merely unfinished, **there is
+nothing an agent's next reply can do about money already spent.** A
+correction can't un-spend it.
 
 <Callout type="error">
-  **This happened for real.** A run with a $5.00 budget crossed the ceiling
-  during its acceptance phase, got "corrected" twice anyway — chasing a gate
-  that was mathematically guaranteed to still be failing — and finished at
-  **$7.50**. Roughly half of that final spend was on two correction rounds
-  that could never have succeeded.
+  **This happened for real.** A run with a $5.00 budget crossed its ceiling
+  during acceptance, got "corrected" anyway — chasing a problem that was
+  mathematically guaranteed to still be there — and finished at **$7.50**.
+  Roughly half of that final spend was two correction attempts that could
+  never have succeeded.
 </Callout>
 
-The fix: budget is checked and dispatched on **first**, separately from the
-general violation list, using the same typed-`kind` dispatch pattern the
-runner already uses for boundary violations (`report.has("budget")` instead
-of matching on violation text). If budget is exceeded on *any* attempt, the
-phase fails immediately — no `session.correct()` call, no additional spend:
+The fix: going over budget is now checked first, on its own, before
+anything else — and it stops the phase immediately rather than triggering
+another paid attempt.
 
-```python
-# Budget is a hard stop, not a retryable violation. Every other gate here
-# fails for a reason a correction can plausibly fix — the agent wrote
-# outside its boundary, missed a criterion. Money already spent is not one
-# of those: no reply the agent sends un-spends it.
-if budget_violation is not None:
-    self.trace.phase_ended(phase, "fail", budget_violation)
-    return _PhaseOutcome(False, usd, had_gate_failure)
-```
+### A hard stop, but a recoverable one
 
-A regression test locks this in: the same $5-budget-crossed-mid-phase
-scenario now stops at exactly $6 (the phase's own single attempt), asserts
-`runs.corrections == 0`, and asserts the phase's `attempt` stayed at `1`.
+Going over budget doesn't fail the run outright — it **pauses** it. You'll
+see this in the yard as a distinct `⏸ budget paused` status, not a plain
+failure. Nothing about the work already done is discarded: a checkpoint of
+the agent's response is saved the moment it comes back, before the budget
+check even runs — so the work you already paid for survives the pause.
+
+<Callout type="info">
+  Recover with `shipyard build --resume <run-id> --budget <higher-amount>`,
+  or the yard's **increase budget & resume** button — either way, it
+  shows you exactly which checkpoint (if any) it will continue from before
+  you commit to the higher spend. See
+  [Checkpointed resume](/architecture/trace-and-recovery#checkpointed-resume)
+  for what gets validated before a checkpoint is reused, and when it's
+  refused instead.
+</Callout>
 
 ## The takeaway
 
-Not every gate failure is the same *kind* of problem. Two questions worth
-asking about any new gate before wiring it into the standard
-violations-and-retry path: can a correction plausibly fix this, and does
-retrying make the underlying problem better, worse, or exactly unchanged?
-Budget is the one gate in the current set where the answer is "worse, every
-time" — which is why it's the one gate that skips the retry path entirely.
+Not every failure is the same kind of problem. Before wiring a new check
+into the standard correction path, it's worth asking: can a correction
+plausibly fix this, and does trying again make it better, worse, or exactly
+unchanged? Budget is the one case in Shipyard today where the honest answer
+is "worse, every time" — which is why it's the one check that skips
+correction entirely and pauses instead.

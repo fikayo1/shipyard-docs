@@ -1,13 +1,17 @@
 export default {
   index: { title: 'Introduction' },
   'getting-started': { title: 'Getting Started' },
-  concepts: { title: 'Core Concepts' },
+  dashboard: { title: 'The Yard (Dashboard)' },
   cli: { title: 'CLI Reference' },
-  topologies: { title: 'Topologies' },
-  architecture: { title: 'Architecture' },
-  dashboard: { title: 'Dashboard (Yard View)' },
   api: { title: 'HTTP API' },
-  adapters: { title: 'Model Adapters' },
+  topologies: { title: 'What You Can Build' },
+  concepts: { title: 'How a Request Becomes Software' },
   acceptance: { title: 'Acceptance & Criteria' },
+  '-- internals': {
+    type: 'separator',
+    title: 'Under the hood'
+  },
+  architecture: { title: 'Architecture' },
+  adapters: { title: 'Model Adapters' },
   testing: { title: 'Testing Philosophy' }
 }
